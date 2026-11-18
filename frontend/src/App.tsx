@@ -10,7 +10,6 @@ import {
   ApiError,
   fetchCarriers,
   fetchHealth,
-  fetchRecentTrackings,
   trackPackage,
 } from './api/client';
 import { ProviderStatusPanel } from './components/ProviderStatusPanel';
@@ -27,6 +26,30 @@ import type {
 } from './types/tracking';
 import { sanitizeTrackingInput } from './utils/carrierDetect';
 
+const LOCAL_RECENT_STORAGE_KEY = 'rapid_screening_recent_v1';
+
+function readLocalRecent(): RecentTrackingSummary[] {
+  try {
+    const raw = window.localStorage.getItem(LOCAL_RECENT_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveLocalRecent(item: RecentTrackingSummary): RecentTrackingSummary[] {
+  const existing = readLocalRecent().filter((x) => x.trackingCode !== item.trackingCode);
+  const next = [item, ...existing].slice(0, 10);
+  try {
+    window.localStorage.setItem(LOCAL_RECENT_STORAGE_KEY, JSON.stringify(next));
+  } catch {
+    // Ignore storage quota errors
+  }
+  return next;
+}
+
 export function App() {
   const [queryCode, setQueryCode] = useState<string>(() => {
     const params = new URLSearchParams(window.location.search);
@@ -42,7 +65,7 @@ export function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
   const [carriers, setCarriers] = useState<CarrierInfo[]>([]);
-  const [recentItems, setRecentItems] = useState<RecentTrackingSummary[]>([]);
+  const [recentItems, setRecentItems] = useState<RecentTrackingSummary[]>(() => readLocalRecent());
 
   const [cooldownRemaining, setCooldownRemaining] = useState(0);
   const [cooldownMessage, setCooldownMessage] = useState<string | null>(null);
@@ -51,13 +74,9 @@ export function App() {
 
   const loadHealthAndRecent = useCallback(async () => {
     try {
-      const [healthData, recentData] = await Promise.all([
-        fetchHealth(),
-        fetchRecentTrackings(),
-      ]);
+      const healthData = await fetchHealth();
       setHealth(healthData);
       setHealthError(null);
-      setRecentItems(recentData.items);
     } catch (err) {
       const msg =
         err instanceof Error
@@ -67,15 +86,14 @@ export function App() {
     }
   }, []);
 
-  // Load initial health, carriers, and recent trackings
+  // Load initial health and carriers
   useEffect(() => {
     const controller = new AbortController();
 
     async function bootstrap() {
-      const [healthRes, carriersRes, recentRes] = await Promise.allSettled([
+      const [healthRes, carriersRes] = await Promise.allSettled([
         fetchHealth(controller.signal),
         fetchCarriers(controller.signal),
-        fetchRecentTrackings(controller.signal),
       ]);
 
       if (controller.signal.aborted) return;
@@ -93,10 +111,6 @@ export function App() {
 
       if (carriersRes.status === 'fulfilled') {
         setCarriers(carriersRes.value);
-      }
-
-      if (recentRes.status === 'fulfilled') {
-        setRecentItems(recentRes.value.items);
       }
     }
 
@@ -151,6 +165,18 @@ export function App() {
         if (controller.signal.aborted) return;
 
         setResult(data);
+        setRecentItems(
+          saveLocalRecent({
+            trackingCode: data.trackingCode,
+            carrierCode: data.carrier.code,
+            carrierName: data.carrier.name,
+            currentStatus: data.currentStatus,
+            currentStatusLabel: data.currentStatusLabel,
+            providerUsed: data.providerUsed,
+            lastUpdatedAt: data.lastUpdatedAt,
+            cddName: data.cdd?.name,
+          }),
+        );
         document.title = `${data.trackingCode} (${data.currentStatusLabel}) — Rapid Screening`;
 
         // Sync URL ?code=... cleanly without page reload

@@ -4,26 +4,32 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 
 	carrierpkg "rapid-screening/pkg/carrier"
 	"rapid-screening/pkg/domain"
 )
 
 // ProviderChain orquestra múltiplos provedores em cascata:
-// free_direct -> siterastreio (1.000 grátis/mês) -> 17track -> trackingmore -> smart_demo_fallback.
+// free_direct -> siterastreio (1.000 grátis/mês) -> 17track -> trackingmore (-> smart_demo_fallback se DEMO_FALLBACK_ENABLED=true).
 type ProviderChain struct {
 	providers []Provider
 }
 
 // NewDefaultChain instancia a cadeia padrão lendo as variáveis de ambiente de configuração e créditos.
+// Em produção (DEMO_FALLBACK_ENABLED != "true"), não inclui dados simulados para evitar falsos positivos.
 func NewDefaultChain() *ProviderChain {
-	return NewChain([]Provider{
+	list := []Provider{
 		NewFreeDirectProviderFromEnv(),
 		NewSiteRastreioProviderFromEnv(),
 		NewTrack17ProviderFromEnv(),
 		NewTrackingMoreProviderFromEnv(),
-		NewSmartFallbackProvider(),
-	})
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("DEMO_FALLBACK_ENABLED")), "true") {
+		list = append(list, NewSmartFallbackProvider())
+	}
+	return NewChain(list)
 }
 
 // NewChain cria uma cadeia personalizada com os provedores fornecidos na ordem de prioridade.

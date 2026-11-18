@@ -405,11 +405,30 @@ func TestNewDefaultChain_OfflineWithoutAPIKeys(t *testing.T) {
 	t.Setenv("SITERASTREIO_MONTHLY_CREDITS", "")
 	t.Setenv("TRACK17_MONTHLY_CREDITS", "")
 	t.Setenv("TRACKINGMORE_MONTHLY_CREDITS", "")
+	t.Setenv("DEMO_FALLBACK_ENABLED", "")
 
+	// 1. Modo produção padrão: sem smart_demo_fallback.
+	prodChain := NewDefaultChain()
+	prodStatuses := prodChain.Statuses()
+	if len(prodStatuses) != 4 {
+		t.Fatalf("expected 4 real providers in production default chain, got %d", len(prodStatuses))
+	}
+	wantProd := []string{"free_direct", "siterastreio", "17track", "trackingmore"}
+	for i, wantName := range wantProd {
+		if prodStatuses[i].Name != wantName {
+			t.Errorf("prodStatuses[%d].Name = %q; want %q", i, prodStatuses[i].Name, wantName)
+		}
+	}
+	if _, err := prodChain.Track(context.Background(), "MND994827162BR", domain.CarrierInfo{}); err == nil {
+		t.Fatal("expected error in production mode when no real provider is configured")
+	}
+
+	// 2. Modo demo explícito (DEMO_FALLBACK_ENABLED=true): inclui smart_demo_fallback.
+	t.Setenv("DEMO_FALLBACK_ENABLED", "true")
 	chain := NewDefaultChain()
 	statuses := chain.Statuses()
 	if len(statuses) != 5 {
-		t.Fatalf("expected 5 providers in default chain, got %d", len(statuses))
+		t.Fatalf("expected 5 providers when DEMO_FALLBACK_ENABLED=true, got %d", len(statuses))
 	}
 
 	wantOrder := []string{"free_direct", "siterastreio", "17track", "trackingmore", "smart_demo_fallback"}

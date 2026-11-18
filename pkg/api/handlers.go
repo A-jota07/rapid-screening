@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"math"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 
 	"rapid-screening/pkg/carrier"
 	"rapid-screening/pkg/domain"
+	"rapid-screening/pkg/providers"
 	"rapid-screening/pkg/store"
 )
 
@@ -178,6 +180,13 @@ func (s *Server) handleTrack(w http.ResponseWriter, r *http.Request) {
 		// Degradação graciosa: se houver cache stale no disco/memória, retorna preservando disponibilidade.
 		if stale, ok := s.store.Get(code, true); ok {
 			s.serveCached(w, stale, "STALE-FALLBACK", 0, refresh)
+			return
+		}
+		if err != nil && errors.Is(err, providers.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]any{
+				"error":   "tracking_not_found",
+				"message": "Encomenda não encontrada nas transportadoras no momento. Verifique o código ou tente novamente mais tarde.",
+			})
 			return
 		}
 		msg := "Não foi possível obter informações de rastreio no momento."

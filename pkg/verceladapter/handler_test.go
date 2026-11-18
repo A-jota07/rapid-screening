@@ -17,6 +17,7 @@ func TestVercelServerlessHandler_RewritesCacheAndWebhooks(t *testing.T) {
 	// Simula ambiente serverless da Vercel antes do sync.Once inicializar.
 	t.Setenv("VERCEL", "1")
 	t.Setenv("FREE_DIRECT_ENABLED", "false")
+	t.Setenv("DEMO_FALLBACK_ENABLED", "true")
 	t.Setenv("TRACK17_API_KEY", "")
 	t.Setenv("TRACKINGMORE_API_KEY", "")
 	t.Setenv("DATA_FILE", filepath.Join(t.TempDir(), "vercel-trackings.json"))
