@@ -1,6 +1,7 @@
 package providers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 )
 
 const (
+	defaultWoncaBaseURL        = "https://api.wonca.com.br/wonca.labs.v1.LabsService/Track"
 	defaultSiteRastreioBaseURL = "https://seurastreio.com.br/api/public/rastreio"
 	defaultSiteRastreioCredits = 1000
 	defaultSiteRastreioTimeout = 6 * time.Second
@@ -66,7 +68,11 @@ func NewSiteRastreioProvider(cfg SiteRastreioConfig) *SiteRastreioProvider {
 	}
 	baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 	if baseURL == "" {
-		baseURL = defaultSiteRastreioBaseURL
+		if strings.HasPrefix(apiKey, "sr_live_") {
+			baseURL = defaultSiteRastreioBaseURL
+		} else {
+			baseURL = defaultWoncaBaseURL
+		}
 	}
 	client := cfg.HTTPClient
 	if client == nil {
@@ -106,15 +112,31 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 	}
 
 	start := p.state.now()
-	endpoint := fmt.Sprintf("%s/%s", p.baseURL, url.PathEscape(cleanCode))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	var req *http.Request
+	var err error
+
+	isWonca := strings.Contains(p.baseURL, "wonca.com.br") || !strings.HasPrefix(p.apiKey, "sr_live_")
+	if isWonca && !strings.Contains(p.baseURL, "seurastreio.com.br") {
+		payloadBytes, _ := json.Marshal(map[string]string{"code": cleanCode})
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL, bytes.NewReader(payloadBytes))
+		if err == nil {
+			req.Header.Set("Authorization", "Apikey "+p.apiKey)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json")
+		}
+	} else {
+		endpoint := fmt.Sprintf("%s/%s", p.baseURL, url.PathEscape(cleanCode))
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err == nil {
+			req.Header.Set("Authorization", "Bearer "+p.apiKey)
+			req.Header.Set("Accept", "application/json")
+		}
+	}
 	if err != nil {
 		p.state.refundCredit()
 		p.state.recordFailure(time.Since(start), err, 0)
 		return nil, fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
 	}
-	req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	req.Header.Set("Accept", "application/json")
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -231,6 +253,41 @@ func collectSiteRastreioEvents(parsed siteRastreioResponse) []siteRastreioEvent 
 	if len(parsed.Eventos) > 0 {
 		return parsed.Eventos
 	}
+	if parsed.Payload != nil {
+		if len(parsed.Payload.Events) > 0 {
+			out := make([]siteRastreioEvent, 0, len(parsed.Payload.Events))
+			for _, ev := range parsed.Payload.Events {
+				loc := strings.TrimSpace(ev.Location)
+				if loc == "" && ev.City != "" {
+					if ev.State != "" {
+						loc = ev.City + "/" + ev.State
+					} else {
+						loc = ev.City
+					}
+				}
+				dt := strings.TrimSpace(ev.Date)
+				if dt != "" && strings.TrimSpace(ev.Time) != "" {
+					dt = dt + "T" + strings.TrimSpace(ev.Time)
+				}
+				out = append(out, siteRastreioEvent{
+					Descricao: ev.Status,
+					Detalhe:   ev.StatusDetail,
+					Data:      dt,
+					Local:     loc,
+					Status:    ev.Status,
+				})
+			}
+			return out
+		}
+		if strings.TrimSpace(parsed.Payload.Status) != "" {
+			return []siteRastreioEvent{{
+				Descricao: parsed.Payload.Status,
+				Detalhe:   parsed.Payload.StatusDetail,
+				Data:      parsed.Payload.MailingDate,
+				Status:    parsed.Payload.Status,
+			}}
+		}
+	}
 	if parsed.EventoMaisRecente != nil &&
 		(strings.TrimSpace(parsed.EventoMaisRecente.Descricao) != "" ||
 			strings.TrimSpace(parsed.EventoMaisRecente.Status) != "" ||
@@ -315,6 +372,28 @@ type siteRastreioEvent struct {
 	Status    string `json:"status"`
 }
 
+type woncaEvent struct {
+	Status       string `json:"status"`
+	StatusDetail string `json:"statusDetail"`
+	Location     string `json:"location"`
+	City         string `json:"city"`
+	State        string `json:"state"`
+	Zip          string `json:"zip"`
+	Date         string `json:"date"`
+	Time         string `json:"time"`
+}
+
+type woncaPayload struct {
+	TrackingNumber string       `json:"trackingNumber"`
+	Found          bool         `json:"found"`
+	Delivered      bool         `json:"delivered"`
+	Status         string       `json:"status"`
+	StatusDetail   string       `json:"statusDetail"`
+	LatestUpdate   string       `json:"latestUpdate"`
+	MailingDate    string       `json:"mailingDate"`
+	Events         []woncaEvent `json:"events"`
+}
+
 type siteRastreioResponse struct {
 	Codigo            string              `json:"codigo"`
 	Status            string              `json:"status"`
@@ -325,4 +404,5 @@ type siteRastreioResponse struct {
 	EventoMaisRecente *siteRastreioEvent  `json:"eventoMaisRecente"`
 	Historico         []siteRastreioEvent `json:"historico"`
 	Eventos           []siteRastreioEvent `json:"eventos"`
+	Payload           *woncaPayload       `json:"payload"`
 }
