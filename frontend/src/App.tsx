@@ -445,14 +445,14 @@ export function App() {
             </span>
             <span aria-hidden="true">·</span>
             <span>
-              Suporte de rastreamento nacional:{' '}
+              Suporte:{' '}
               <a
-                href="https://www.siterastreio.com.br"
+                href="https://www.siterastreio.com.br/"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="font-semibold text-[#2E5A44] underline decoration-[#BBD4C6] underline-offset-2 hover:text-[#234735]"
               >
-                Site Rastreio
+                Rastreamento
               </a>
             </span>
           </p>
