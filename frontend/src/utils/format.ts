@@ -124,6 +124,8 @@ export function formatProviderName(providerUsed: string, cached?: boolean): stri
   switch (providerUsed) {
     case 'free_direct':
       return 'Free Direct (Consulta Direta Gratuita)';
+    case 'siterastreio':
+      return 'Site Rastreio (1.000 grátis/mês)';
     case '17track':
       return '17TRACK (Agregador Primário)';
     case 'trackingmore':

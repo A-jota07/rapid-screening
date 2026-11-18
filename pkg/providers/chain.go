@@ -9,7 +9,8 @@ import (
 	"rapid-screening/pkg/domain"
 )
 
-// ProviderChain orquestra múltiplos provedores em cascata (free_direct -> 17track -> trackingmore -> smart_demo_fallback).
+// ProviderChain orquestra múltiplos provedores em cascata:
+// free_direct -> siterastreio (1.000 grátis/mês) -> 17track -> trackingmore -> smart_demo_fallback.
 type ProviderChain struct {
 	providers []Provider
 }
@@ -18,6 +19,7 @@ type ProviderChain struct {
 func NewDefaultChain() *ProviderChain {
 	return NewChain([]Provider{
 		NewFreeDirectProviderFromEnv(),
+		NewSiteRastreioProviderFromEnv(),
 		NewTrack17ProviderFromEnv(),
 		NewTrackingMoreProviderFromEnv(),
 		NewSmartFallbackProvider(),

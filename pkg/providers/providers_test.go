@@ -398,31 +398,37 @@ func TestProviderChain_FallbackWhenProvidersFailOrExhaustCredits(t *testing.T) {
 
 func TestNewDefaultChain_OfflineWithoutAPIKeys(t *testing.T) {
 	t.Setenv("FREE_DIRECT_ENABLED", "false")
+	t.Setenv("SITERASTREIO_API_KEY", "")
+	t.Setenv("SEURASTREIO_API_KEY", "")
 	t.Setenv("TRACK17_API_KEY", "")
 	t.Setenv("TRACKINGMORE_API_KEY", "")
+	t.Setenv("SITERASTREIO_MONTHLY_CREDITS", "")
 	t.Setenv("TRACK17_MONTHLY_CREDITS", "")
 	t.Setenv("TRACKINGMORE_MONTHLY_CREDITS", "")
 
 	chain := NewDefaultChain()
 	statuses := chain.Statuses()
-	if len(statuses) != 4 {
-		t.Fatalf("expected 4 providers in default chain, got %d", len(statuses))
+	if len(statuses) != 5 {
+		t.Fatalf("expected 5 providers in default chain, got %d", len(statuses))
 	}
 
-	wantOrder := []string{"free_direct", "17track", "trackingmore", "smart_demo_fallback"}
+	wantOrder := []string{"free_direct", "siterastreio", "17track", "trackingmore", "smart_demo_fallback"}
 	for i, wantName := range wantOrder {
 		if statuses[i].Name != wantName {
 			t.Errorf("statuses[%d].Name = %q; want %q", i, statuses[i].Name, wantName)
 		}
 	}
-	if statuses[1].CreditsRemaining != 100 || statuses[1].Configured {
-		t.Errorf("expected 17track default 100 credits & unconfigured, got %+v", statuses[1])
+	if statuses[1].CreditsRemaining != 1000 || statuses[1].Configured {
+		t.Errorf("expected siterastreio default 1000 credits & unconfigured, got %+v", statuses[1])
 	}
-	if statuses[2].CreditsRemaining != 50 || statuses[2].Configured {
-		t.Errorf("expected trackingmore default 50 credits & unconfigured, got %+v", statuses[2])
+	if statuses[2].CreditsRemaining != 100 || statuses[2].Configured {
+		t.Errorf("expected 17track default 100 credits & unconfigured, got %+v", statuses[2])
 	}
-	if !statuses[3].Available || statuses[3].CreditsRemaining != -1 {
-		t.Errorf("expected smart_demo_fallback available & unlimited, got %+v", statuses[3])
+	if statuses[3].CreditsRemaining != 50 || statuses[3].Configured {
+		t.Errorf("expected trackingmore default 50 credits & unconfigured, got %+v", statuses[3])
+	}
+	if !statuses[4].Available || statuses[4].CreditsRemaining != -1 {
+		t.Errorf("expected smart_demo_fallback available & unlimited, got %+v", statuses[4])
 	}
 
 	res, err := chain.Track(context.Background(), "MND994827162BR", domain.CarrierInfo{})
@@ -544,4 +550,142 @@ func TestProviderChain_ConcurrentAccess(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestSiteRastreioProvider_HistoryAndLatestOnlyFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer sr_live_test_123" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/AA123456789BR":
+			_, _ = w.Write([]byte(`{
+				"codigo": "AA123456789BR",
+				"status": "found",
+				"success": true,
+				"previsaoEntrega": "2026-11-22T18:00:00.000Z",
+				"eventoMaisRecente": {
+					"codigo": "LDI",
+					"descricao": "Objeto aguardando retirada no endereço indicado",
+					"detalhe": "CDD Vila Mariana",
+					"data": "2026-11-18T10:15:00.000Z",
+					"local": "São Paulo/SP"
+				},
+				"historico": [
+					{
+						"codigo": "LDI",
+						"descricao": "Objeto aguardando retirada no endereço indicado",
+						"detalhe": "CDD Vila Mariana",
+						"data": "2026-11-18T10:15:00.000Z",
+						"local": "São Paulo/SP"
+					},
+					{
+						"codigo": "RO",
+						"descricao": "Objeto em trânsito - por favor aguarde",
+						"detalhe": "Unidade de Tratamento",
+						"data": "2026-11-16T08:00:00.000Z",
+						"local": "Curitiba/PR",
+						"destino": "São Paulo/SP"
+					}
+				]
+			}`))
+		case "/NL987654321BR":
+			// Plano gratuito padrão retorna apenas eventoMaisRecente.
+			_, _ = w.Write([]byte(`{
+				"codigo": "NL987654321BR",
+				"status": "found",
+				"success": true,
+				"eventoMaisRecente": {
+					"codigo": "OEC",
+					"descricao": "Objeto saiu para entrega ao destinatário",
+					"detalhe": "Em rota local",
+					"data": "2026-11-18T12:00:00.000Z",
+					"local": "Belo Horizonte/MG"
+				}
+			}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"success":false,"message":"Objeto não encontrado"}`))
+		}
+	}))
+	defer srv.Close()
+
+	p := NewSiteRastreioProvider(SiteRastreioConfig{
+		APIKey:         "sr_live_test_123",
+		MonthlyCredits: 1000,
+		BaseURL:        srv.URL,
+	})
+
+	// 1. Histórico completo + previsão de entrega.
+	res1, err := p.Track(context.Background(), "AA123456789BR", carrierpkg.DetectCarrier("AA123456789BR"))
+	if err != nil {
+		t.Fatalf("Track AA123456789BR failed: %v", err)
+	}
+	if res1.ProviderUsed != "siterastreio" {
+		t.Errorf("ProviderUsed = %q; want siterastreio", res1.ProviderUsed)
+	}
+	if res1.CurrentStatus != domain.StatusAtCDD || res1.ProgressStep != 3 {
+		t.Errorf("got status=%q step=%d; want AT_CDD step=3", res1.CurrentStatus, res1.ProgressStep)
+	}
+	if res1.EstimatedDelivery != "2026-11-22" {
+		t.Errorf("EstimatedDelivery = %q; want 2026-11-22", res1.EstimatedDelivery)
+	}
+	if len(res1.Events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(res1.Events))
+	}
+
+	// 2. Plano gratuito apenas com eventoMaisRecente.
+	res2, err := p.Track(context.Background(), "NL987654321BR", carrierpkg.DetectCarrier("NL987654321BR"))
+	if err != nil {
+		t.Fatalf("Track NL987654321BR failed: %v", err)
+	}
+	if res2.CurrentStatus != domain.StatusOutForDelivery || len(res2.Events) != 1 {
+		t.Fatalf("unexpected free-tier result: status=%q events=%d", res2.CurrentStatus, len(res2.Events))
+	}
+
+	if st := p.Status(); st.CreditsRemaining != 998 || !st.Available {
+		t.Errorf("expected 998 credits remaining, got %+v", st)
+	}
+
+	// 3. HTTP 404 devolve crédito e não abre circuit-breaker.
+	_, err = p.Track(context.Background(), "BR999999999XX", domain.CarrierInfo{})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound on 404, got %v", err)
+	}
+	if st := p.Status(); st.CreditsRemaining != 998 || st.CircuitOpen {
+		t.Errorf("expected credit refunded (998) and circuit closed on 404, got %+v", st)
+	}
+}
+
+func TestSiteRastreioProvider_QuotaExhaustionTriggersChainFallback(t *testing.T) {
+	srSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"monthly_quota_exceeded","message":"Cota mensal de 1000 requisições atingida"}`))
+	}))
+	defer srSrv.Close()
+
+	sr := NewSiteRastreioProvider(SiteRastreioConfig{
+		APIKey:          "sr_live_test_123",
+		MonthlyCredits:  1000,
+		BaseURL:         srSrv.URL,
+		CircuitDuration: 5 * time.Minute,
+	})
+
+	chain := NewChain([]Provider{
+		sr,
+		NewSmartFallbackProvider(),
+	})
+
+	res, err := chain.Track(context.Background(), "AA123456789BR", carrierpkg.DetectCarrier("AA123456789BR"))
+	if err != nil {
+		t.Fatalf("chain fallback failed: %v", err)
+	}
+	if res.ProviderUsed != "smart_demo_fallback" {
+		t.Errorf("expected fallback to smart_demo_fallback, got %q", res.ProviderUsed)
+	}
+	if st := sr.Status(); !st.CircuitOpen || st.CreditsRemaining != 0 || st.Available {
+		t.Errorf("expected siterastreio circuit open & 0 credits, got %+v", st)
+	}
 }

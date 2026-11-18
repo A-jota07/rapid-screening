@@ -23,9 +23,10 @@ Sistema full-stack gratuito de rastreamento de encomendas construído com **Go**
   `Postado` → `Em trânsito` → `Alocado no CDD / Aguardando retirada` / `Saiu para entrega` → `Entregue` (além de `Ocorrência / Atenção`).
 - **Cadeia Multi-Provedor com Fallback e Circuit-Breaker (`pkg/providers/chain.go`)**:
   1. `free_direct` — Consulta gratuita direta quando disponível (`FREE_DIRECT_ENABLED=true`).
-  2. `17track` — **17TRACK API v2.2** (`TRACK17_API_KEY`) com controle de créditos e abertura automática de circuit-breaker em HTTP 429 / cota esgotada.
-  3. `trackingmore` — **TrackingMore API v4** (`TRACKINGMORE_API_KEY`) como failover imediato quando a 17TRACK falhar ou ficar sem créditos.
-  4. `smart_demo_fallback` — Fallback determinístico gratuito com rotas e CDDs brasileiros reais, garantindo funcionamento mesmo sem chaves de API ou após o esgotamento de cotas gratuitas.
+  2. `siterastreio` — **API Site Rastreio / Seu Rastreio** (`SITERASTREIO_API_KEY`) com **1.000 requisições gratuitas por mês** renováveis e crédito de rodapé automático no frontend.
+  3. `17track` — **17TRACK API v2.2** (`TRACK17_API_KEY`) com controle de créditos e abertura automática de circuit-breaker em HTTP 429 / cota esgotada.
+  4. `trackingmore` — **TrackingMore API v4** (`TRACKINGMORE_API_KEY`) como failover imediato quando os anteriores falharem ou ficarem sem créditos.
+  5. `smart_demo_fallback` — Fallback determinístico gratuito com rotas e CDDs brasileiros reais, garantindo funcionamento mesmo sem chaves de API ou após o esgotamento de cotas gratuitas.
 - **Cache em Múltiplas Camadas + Webhooks**:
   - **Edge CDN da Vercel**: `Cache-Control: public, s-maxage=300, stale-while-revalidate=600` em `GET /api/v1/track/{code}` (desativado em `?refresh=true`).
   - **Cache L1 em memória** com TTL dinâmico (`15 min` em trânsito, `10 min` no CDD/em rota, `24h` entregue) + **cooldown anti-abuso** de 60s.

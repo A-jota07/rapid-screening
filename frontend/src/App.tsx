@@ -439,8 +439,22 @@ export function App() {
             <strong className="font-semibold text-[#23221F]">Rapid Screening</strong> —
             Interface acolhedora para rastreamento e retirada presencial em CDD.
           </p>
-          <p>
-            Todas as consultas trafegam exclusivamente pelo backend interno (<code>/api/v1</code>).
+          <p className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span>
+              Todas as consultas trafegam exclusivamente pelo backend interno (<code>/api/v1</code>).
+            </span>
+            <span aria-hidden="true">·</span>
+            <span>
+              Suporte de rastreamento nacional:{' '}
+              <a
+                href="https://www.siterastreio.com.br"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-semibold text-[#2E5A44] underline decoration-[#BBD4C6] underline-offset-2 hover:text-[#234735]"
+              >
+                Site Rastreio
+              </a>
+            </span>
           </p>
         </div>
       </footer>
