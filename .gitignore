@@ -1,0 +1,21 @@
+# Binários e builds
+/bin/
+/frontend/dist/
+/frontend/node_modules/
+*.tsbuildinfo
+
+# Ambiente e segredos (nunca commitar chaves de API)
+.env
+.env.*
+!.env.example
+
+# Dados locais gerados em runtime
+/data/*.json
+/data/*.tmp
+
+# Vercel CLI
+/.vercel/
+
+# Logs e editor
+*.log
+.DS_Store
