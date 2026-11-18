@@ -4,7 +4,7 @@ import (
 	"strings"
 	"unicode"
 
-	"rapid-screening/internal/domain"
+	"rapid-screening/pkg/domain"
 )
 
 type statusRule struct {

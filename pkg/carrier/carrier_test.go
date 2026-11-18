@@ -3,7 +3,7 @@ package carrier
 import (
 	"testing"
 
-	"rapid-screening/internal/domain"
+	"rapid-screening/pkg/domain"
 )
 
 func TestSanitizeCode(t *testing.T) {

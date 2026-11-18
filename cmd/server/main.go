@@ -13,10 +13,10 @@ import (
 	"syscall"
 	"time"
 
-	"rapid-screening/internal/api"
-	"rapid-screening/internal/geo"
-	"rapid-screening/internal/providers"
-	"rapid-screening/internal/store"
+	"rapid-screening/pkg/api"
+	"rapid-screening/pkg/geo"
+	"rapid-screening/pkg/providers"
+	"rapid-screening/pkg/store"
 )
 
 func main() {

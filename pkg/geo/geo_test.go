@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"rapid-screening/internal/domain"
+	"rapid-screening/pkg/domain"
 )
 
 func TestCatalogEnricherImplementsDomainInterface(t *testing.T) {

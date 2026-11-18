@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode"
 
-	"rapid-screening/internal/domain"
+	"rapid-screening/pkg/domain"
 )
 
 // CatalogEntry representa um Hub ou CDD (Centro de Distribuição Domiciliária) cadastrado no Brasil.

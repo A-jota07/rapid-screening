@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"rapid-screening/internal/domain"
+	"rapid-screening/pkg/domain"
 )
 
 func TestStoreSaveGetAndStats(t *testing.T) {

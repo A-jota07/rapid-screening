@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	carrierpkg "rapid-screening/internal/carrier"
-	"rapid-screening/internal/domain"
+	carrierpkg "rapid-screening/pkg/carrier"
+	"rapid-screening/pkg/domain"
 )
 
 type brazilCityHub struct {

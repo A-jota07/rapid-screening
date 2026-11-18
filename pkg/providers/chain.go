@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	carrierpkg "rapid-screening/internal/carrier"
-	"rapid-screening/internal/domain"
+	carrierpkg "rapid-screening/pkg/carrier"
+	"rapid-screening/pkg/domain"
 )
 
 // ProviderChain orquestra múltiplos provedores em cascata (free_direct -> 17track -> trackingmore -> smart_demo_fallback).

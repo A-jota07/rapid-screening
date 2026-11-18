@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"rapid-screening/internal/domain"
+	"rapid-screening/pkg/domain"
 )
 
 const (

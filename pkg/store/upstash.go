@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"rapid-screening/internal/domain"
+	"rapid-screening/pkg/domain"
 )
 
 const (

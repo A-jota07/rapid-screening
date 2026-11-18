@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"rapid-screening/internal/carrier"
-	"rapid-screening/internal/domain"
+	"rapid-screening/pkg/carrier"
+	"rapid-screening/pkg/domain"
 )
 
 const maxWebhookBodyBytes = 2 << 20 // 2 MiB

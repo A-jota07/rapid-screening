@@ -1,4 +1,4 @@
-package handler
+package verceladapter
 
 import (
 	"bytes"
@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"rapid-screening/internal/domain"
+	"rapid-screening/pkg/domain"
 )
 
 func TestVercelServerlessHandler_RewritesCacheAndWebhooks(t *testing.T) {

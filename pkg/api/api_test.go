@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"rapid-screening/internal/domain"
-	"rapid-screening/internal/geo"
-	"rapid-screening/internal/providers"
-	"rapid-screening/internal/store"
+	"rapid-screening/pkg/domain"
+	"rapid-screening/pkg/geo"
+	"rapid-screening/pkg/providers"
+	"rapid-screening/pkg/store"
 )
 
 // Garante em tempo de compilação que *providers.ProviderChain atende ao contrato de TrackerProvider.

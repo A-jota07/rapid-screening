@@ -8,7 +8,7 @@ Sistema full-stack gratuito de rastreamento de encomendas construído com **Go**
 
 ### 1. Backend em Go Seguro, Modular e Anti-Desperdício de Créditos
 - **Chaves de API 100% protegidas no backend**: o frontend nunca acessa provedores externos diretamente; todas as requisições passam por `/api/v1/...`.
-- **Detecção automática de transportadora via Regex (`internal/carrier/detector.go`)**:
+- **Detecção automática de transportadora via Regex (`pkg/carrier/detector.go`)**:
   - **Correios** (`^[A-Z]{2}\d{9}[A-Z]{2}$` — ex: `AA123456789BR`, `NL987654321BR`)
   - **Azul Cargo Express** (`^(AZ|AZL|800)\d{8,11}[A-Z0-9]{0,2}$`, `^AZUL[A-Z0-9]{6,12}$`, `^577\d{8}$`)
   - **Loggi** (`^(LGG|LOG|LG)[A-Z0-9]{8,14}$`)
@@ -18,10 +18,10 @@ Sistema full-stack gratuito de rastreamento de encomendas construído com **Go**
   - **Total Express** (`^(TEX|TOT)[A-Z0-9]{8,13}$`, `^7\d{10,12}$`)
   - **Sequoia / Shopee Xpress / Cainiao / J&T Express**
   - Códigos fora dos padrões acima são marcados como `auto` para detecção pela API agregadora.
-- **Padronização de Status (`internal/carrier/normalizer.go`)**:
+- **Padronização de Status (`pkg/carrier/normalizer.go`)**:
   Traduz mensagens heterogêneas (PT/EN) para estados fixos:
   `Postado` → `Em trânsito` → `Alocado no CDD / Aguardando retirada` / `Saiu para entrega` → `Entregue` (além de `Ocorrência / Atenção`).
-- **Cadeia Multi-Provedor com Fallback e Circuit-Breaker (`internal/providers/chain.go`)**:
+- **Cadeia Multi-Provedor com Fallback e Circuit-Breaker (`pkg/providers/chain.go`)**:
   1. `free_direct` — Consulta gratuita direta quando disponível (`FREE_DIRECT_ENABLED=true`).
   2. `17track` — **17TRACK API v2.2** (`TRACK17_API_KEY`) com controle de créditos e abertura automática de circuit-breaker em HTTP 429 / cota esgotada.
   3. `trackingmore` — **TrackingMore API v4** (`TRACKINGMORE_API_KEY`) como failover imediato quando a 17TRACK falhar ou ficar sem créditos.
@@ -49,13 +49,14 @@ rapid-screening/
 │   ├── index.go             # Entrypoint Vercel Go Serverless Function
 │   └── index_test.go
 ├── cmd/server/main.go       # Servidor HTTP local para desenvolvimento/Docker
-├── internal/
+├── pkg/
 │   ├── api/                 # Handlers REST, middlewares (CORS, rate-limit) e webhooks
 │   ├── carrier/             # Regex de transportadoras e normalizador de status
 │   ├── domain/              # Modelos canônicos compartilhados
 │   ├── geo/                 # Catálogo de Hubs e CDDs brasileiros
 │   ├── providers/           # FreeDirect, 17TRACK, TrackingMore, SmartFallback e Chain
-│   └── store/               # Cache L1, persistência JSON /tmp e Upstash Redis REST
+│   ├── store/               # Cache L1, persistência JSON /tmp e Upstash Redis REST
+│   └── verceladapter/       # Handler compartilhado para Vercel Serverless Functions
 ├── frontend/                # Aplicação React + TypeScript + Vite + Tailwind + Leaflet
 ├── migrations/001_init.sql  # Schema PostgreSQL para uso opcional com Docker/RDS
 ├── docker-compose.yml       # PostgreSQL 16 + Redis 7 + serviço Go opcional
