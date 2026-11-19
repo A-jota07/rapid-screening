@@ -225,7 +225,7 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 		return nil, parseErr
 	}
 
-	rawEvents, estimatedFromNested := collectSiteRastreioEvents(parsed)
+	rawEvents, estimatedFromNested := collectSiteRastreioEvents(parsed, rawBody)
 	if (parsed.Success != nil && !*parsed.Success) || len(rawEvents) == 0 {
 		msg := strings.TrimSpace(parsed.Message)
 		if msg == "" {
@@ -238,7 +238,11 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 			return nil, quotaErr
 		}
 		p.state.refundCredit()
-		notFoundErr := fmt.Errorf("%w: siterastreio no events (%s)", ErrNotFound, msg)
+		snippet := strings.TrimSpace(string(rawBody))
+		if len(snippet) > 220 {
+			snippet = snippet[:220] + "..."
+		}
+		notFoundErr := fmt.Errorf("%w: siterastreio no events (msg=%q body=%s)", ErrNotFound, msg, snippet)
 		p.state.recordFailure(time.Since(start), notFoundErr, 0)
 		return nil, notFoundErr
 	}
@@ -263,17 +267,21 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 	return result, nil
 }
 
-func collectSiteRastreioEvents(parsed siteRastreioResponse) ([]siteRastreioEvent, string) {
-	// 1. Wonca Labs para Correios retorna {"json": "{\"codObjeto\":..., \"eventos\":[...]}"}
-	if strings.TrimSpace(parsed.JSON) != "" {
-		var nested woncaCorreiosJSON
-		if err := json.Unmarshal([]byte(parsed.JSON), &nested); err == nil && len(nested.Eventos) > 0 {
-			out := make([]siteRastreioEvent, 0, len(nested.Eventos))
-			for _, ev := range nested.Eventos {
-				out = append(out, mapWoncaCorreiosEvent(ev))
-			}
-			return out, nested.DtPrevista
+func collectSiteRastreioEvents(parsed siteRastreioResponse, rawBody []byte) ([]siteRastreioEvent, string) {
+	// 1. Wonca Labs para Correios retorna {"json": "{\"codObjeto\":..., \"eventos\":[...]}"} ou {"json": {...}}
+	if len(parsed.JSON) > 0 && string(parsed.JSON) != "null" {
+		innerBytes := parsed.JSON
+		var asString string
+		if err := json.Unmarshal(parsed.JSON, &asString); err == nil && strings.TrimSpace(asString) != "" {
+			innerBytes = []byte(asString)
 		}
+		if evs, est := parseWoncaCorreiosBytes(innerBytes); len(evs) > 0 {
+			return evs, est
+		}
+	}
+	// 2. Correios SRO / Wonca direto na raiz (eventos com unidade/dtHrCriado ou objetos[0].eventos)
+	if evs, est := parseWoncaCorreiosBytes(rawBody); len(evs) > 0 {
+		return evs, est
 	}
 	if len(parsed.Historico) > 0 {
 		return parsed.Historico, parsed.DtPrevista
@@ -321,6 +329,34 @@ func collectSiteRastreioEvents(parsed siteRastreioResponse) ([]siteRastreioEvent
 			strings.TrimSpace(parsed.EventoMaisRecente.Status) != "" ||
 			strings.TrimSpace(parsed.EventoMaisRecente.Detalhe) != "") {
 		return []siteRastreioEvent{*parsed.EventoMaisRecente}, ""
+	}
+	return nil, ""
+}
+
+func parseWoncaCorreiosBytes(data []byte) ([]siteRastreioEvent, string) {
+	var nested woncaCorreiosJSON
+	if err := json.Unmarshal(data, &nested); err != nil {
+		return nil, ""
+	}
+	if len(nested.Eventos) > 0 {
+		out := make([]siteRastreioEvent, 0, len(nested.Eventos))
+		for _, ev := range nested.Eventos {
+			if strings.TrimSpace(ev.Descricao) == "" && strings.TrimSpace(ev.Detalhe) == "" {
+				continue
+			}
+			out = append(out, mapWoncaCorreiosEvent(ev))
+		}
+		if len(out) > 0 {
+			return out, nested.DtPrevista
+		}
+	}
+	if len(nested.Objetos) > 0 && len(nested.Objetos[0].Eventos) > 0 {
+		obj := nested.Objetos[0]
+		out := make([]siteRastreioEvent, 0, len(obj.Eventos))
+		for _, ev := range obj.Eventos {
+			out = append(out, mapWoncaCorreiosEvent(ev))
+		}
+		return out, obj.DtPrevista
 	}
 	return nil, ""
 }
@@ -493,10 +529,15 @@ type woncaCorreiosJSON struct {
 	CodObjeto  string               `json:"codObjeto"`
 	DtPrevista string               `json:"dtPrevista"`
 	Eventos    []woncaCorreiosEvent `json:"eventos"`
+	Objetos    []struct {
+		CodObjeto  string               `json:"codObjeto"`
+		DtPrevista string               `json:"dtPrevista"`
+		Eventos    []woncaCorreiosEvent `json:"eventos"`
+	} `json:"objetos"`
 }
 
 type siteRastreioResponse struct {
-	JSON              string              `json:"json"`
+	JSON              json.RawMessage     `json:"json"`
 	Codigo            string              `json:"codigo"`
 	Status            string              `json:"status"`
 	Success           *bool               `json:"success"`
