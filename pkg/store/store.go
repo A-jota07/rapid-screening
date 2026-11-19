@@ -242,7 +242,9 @@ func (s *TrackingStore) Save(result *domain.TrackingResult) error {
 	var recentSnapshot []domain.RecentTrackingSummary
 	var entrySnapshot *cacheEntry
 	if s.upstash != nil {
-		recentSnapshot = s.buildRecentLocked(upstashRecentMaxSize)
+		if !strings.EqualFold(strings.TrimSpace(os.Getenv("VERCEL_ENV")), "production") {
+			recentSnapshot = s.buildRecentLocked(upstashRecentMaxSize)
+		}
 		entrySnapshot = &cacheEntry{
 			Result:      cloneTrackingResult(toStore),
 			LastFetchAt: now,
@@ -335,7 +337,9 @@ func (s *TrackingStore) UpsertFromWebhook(code string, carrierHint domain.Carrie
 	var recentSnapshot []domain.RecentTrackingSummary
 	var entrySnapshot *cacheEntry
 	if err == nil && s.upstash != nil {
-		recentSnapshot = s.buildRecentLocked(upstashRecentMaxSize)
+		if !strings.EqualFold(strings.TrimSpace(os.Getenv("VERCEL_ENV")), "production") {
+			recentSnapshot = s.buildRecentLocked(upstashRecentMaxSize)
+		}
 		entrySnapshot = &cacheEntry{
 			Result:      cloneTrackingResult(current),
 			LastFetchAt: now,
@@ -353,7 +357,11 @@ func (s *TrackingStore) UpsertFromWebhook(code string, carrierHint domain.Carrie
 }
 
 // Recent retorna os rastreamentos mais recentemente atualizados ordenados do mais novo para o mais antigo.
+// Em produção (VERCEL_ENV=production), retorna lista vazia para evitar exposição pública de códigos de rastreio de terceiros (IDOR/PII).
 func (s *TrackingStore) Recent(limit int) []domain.RecentTrackingSummary {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("VERCEL_ENV")), "production") {
+		return []domain.RecentTrackingSummary{}
+	}
 	if limit <= 0 {
 		limit = 10
 	}

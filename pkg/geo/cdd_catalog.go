@@ -78,8 +78,16 @@ func (c *CatalogEnricher) Enrich(result *domain.TrackingResult) {
 		defaultFacType := facilityTypeForEvent(*ev)
 
 		if ev.Coordinates == nil || !hasValidCoords(ev.Coordinates) {
-			if pt := c.ResolveLocation(ev.Location, ev.Description, carrierCode, defaultFacType); pt != nil {
-				ev.Coordinates = pt
+			queryLoc := ev.Location
+			if ev.Coordinates != nil {
+				queryLoc = joinNonEmpty(ev.Coordinates.FacilityName, ev.Coordinates.Address, ev.Coordinates.City, ev.Coordinates.State, ev.Location)
+			}
+			if pt := c.ResolveLocation(queryLoc, ev.Description, carrierCode, defaultFacType); pt != nil {
+				if ev.Coordinates != nil {
+					mergeGeoPoint(ev.Coordinates, pt, defaultFacType)
+				} else {
+					ev.Coordinates = pt
+				}
 			}
 		} else {
 			if ev.Coordinates.FacilityType == "" {
@@ -180,8 +188,9 @@ func (c *CatalogEnricher) Enrich(result *domain.TrackingResult) {
 		}
 	}
 
-	// Garantir CurrentLocation mesmo se eventos iniciais não tinham localização mas CDD/Origin existirem.
-	if result.CurrentLocation == nil {
+	// Garantir CurrentLocation mesmo se eventos iniciais não tinham coordenadas no catálogo,
+	// extraindo do CDD, Origin ou do texto/metadados do último evento registrado.
+	if result.CurrentLocation == nil || !hasValidCoords(result.CurrentLocation) {
 		if result.CDD != nil && result.CDD.Lat != 0 {
 			result.CurrentLocation = &domain.GeoPoint{
 				Lat:          result.CDD.Lat,
@@ -193,8 +202,20 @@ func (c *CatalogEnricher) Enrich(result *domain.TrackingResult) {
 				FacilityType: "CDD",
 				FacilityName: result.CDD.Name,
 			}
-		} else if result.Origin != nil {
+		} else if result.Origin != nil && hasValidCoords(result.Origin) {
 			result.CurrentLocation = cloneGeoPoint(result.Origin)
+		} else if len(chrono) > 0 {
+			latestEv := chrono[len(chrono)-1]
+			if latestEv.Coordinates != nil && (latestEv.Coordinates.City != "" || latestEv.Coordinates.FacilityName != "") {
+				result.CurrentLocation = cloneGeoPoint(latestEv.Coordinates)
+			} else if strings.TrimSpace(latestEv.Location) != "" {
+				result.CurrentLocation = &domain.GeoPoint{
+					City:         strings.TrimSpace(latestEv.Location),
+					State:        extractStateCode(latestEv.Location + " " + latestEv.Description),
+					FacilityType: facilityTypeForEvent(latestEv),
+					FacilityName: strings.TrimSpace(latestEv.Location),
+				}
+			}
 		}
 	}
 
@@ -902,9 +923,12 @@ func isLikelyStateToken(rawText, upperTok string) bool {
 		return true
 	}
 	if strings.Contains(upper, "/"+upperTok) ||
+		strings.Contains(upper, "/ "+upperTok) ||
 		strings.Contains(upper, "- "+upperTok) ||
 		strings.Contains(upper, "-"+upperTok) ||
-		strings.Contains(upper, ", "+upperTok) {
+		strings.Contains(upper, ", "+upperTok) ||
+		strings.Contains(upper, ","+upperTok) ||
+		strings.Contains(upper, "("+upperTok+")") {
 		return true
 	}
 	// Evitar confundir palavras minúsculas como "se" ou "para" com siglas de UF; exige maiúscula após espaço.

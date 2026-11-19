@@ -238,11 +238,7 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 			return nil, quotaErr
 		}
 		p.state.refundCredit()
-		snippet := strings.TrimSpace(string(rawBody))
-		if len(snippet) > 220 {
-			snippet = snippet[:220] + "..."
-		}
-		notFoundErr := fmt.Errorf("%w: siterastreio no events (msg=%q body=%s)", ErrNotFound, msg, snippet)
+		notFoundErr := fmt.Errorf("%w: siterastreio no events (%s)", ErrNotFound, msg)
 		p.state.recordFailure(time.Since(start), notFoundErr, 0)
 		return nil, notFoundErr
 	}
@@ -262,6 +258,15 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 		Events:            events,
 	}
 
+	for _, ev := range rawEvents {
+		if ev.DestinationPoint != nil && (ev.DestinationPoint.City != "" || ev.DestinationPoint.State != "" || ev.DestinationPoint.FacilityName != "") {
+			cp := *ev.DestinationPoint
+			cp.FacilityType = "DESTINATION"
+			result.Destination = &cp
+			break
+		}
+	}
+
 	finalizeTrackingResult(result, cleanCode, carrierInfo, p.Name(), p.state.now())
 	p.state.recordSuccess(time.Since(start))
 	return result, nil
@@ -279,7 +284,7 @@ func collectSiteRastreioEvents(parsed siteRastreioResponse, rawBody []byte) ([]s
 			return evs, est
 		}
 	}
-	// 2. Correios SRO / Wonca direto na raiz (eventos com unidade/dtHrCriado ou objetos[0].eventos)
+	// 2. Correios SRO / Wonca direto na raiz (eventos com unidade/dtHrCriado, objetos[0].eventos ou payload.eventos)
 	if evs, est := parseWoncaCorreiosBytes(rawBody); len(evs) > 0 {
 		return evs, est
 	}
@@ -290,6 +295,31 @@ func collectSiteRastreioEvents(parsed siteRastreioResponse, rawBody []byte) ([]s
 		return parsed.Eventos, parsed.DtPrevista
 	}
 	if parsed.Payload != nil {
+		if len(parsed.Payload.Eventos) > 0 {
+			out := make([]siteRastreioEvent, 0, len(parsed.Payload.Eventos))
+			for _, ev := range parsed.Payload.Eventos {
+				if strings.TrimSpace(ev.Descricao) == "" && strings.TrimSpace(ev.Detalhe) == "" {
+					continue
+				}
+				out = append(out, mapWoncaCorreiosEvent(ev))
+			}
+			if len(out) > 0 {
+				return out, parsed.Payload.DtPrevista
+			}
+		}
+		if len(parsed.Payload.Objetos) > 0 && len(parsed.Payload.Objetos[0].Eventos) > 0 {
+			obj := parsed.Payload.Objetos[0]
+			out := make([]siteRastreioEvent, 0, len(obj.Eventos))
+			for _, ev := range obj.Eventos {
+				if strings.TrimSpace(ev.Descricao) == "" && strings.TrimSpace(ev.Detalhe) == "" {
+					continue
+				}
+				out = append(out, mapWoncaCorreiosEvent(ev))
+			}
+			if len(out) > 0 {
+				return out, obj.DtPrevista
+			}
+		}
 		if len(parsed.Payload.Events) > 0 {
 			out := make([]siteRastreioEvent, 0, len(parsed.Payload.Events))
 			for _, ev := range parsed.Payload.Events {
@@ -305,12 +335,23 @@ func collectSiteRastreioEvents(parsed siteRastreioResponse, rawBody []byte) ([]s
 				if dt != "" && strings.TrimSpace(ev.Time) != "" {
 					dt = dt + "T" + strings.TrimSpace(ev.Time)
 				}
+				var pt *domain.GeoPoint
+				if ev.City != "" || ev.State != "" || loc != "" {
+					pt = &domain.GeoPoint{
+						City:         strings.TrimSpace(ev.City),
+						State:        strings.TrimSpace(ev.State),
+						ZipCode:      strings.TrimSpace(ev.Zip),
+						FacilityType: "HUB",
+						FacilityName: loc,
+					}
+				}
 				out = append(out, siteRastreioEvent{
 					Descricao: ev.Status,
 					Detalhe:   ev.StatusDetail,
 					Data:      dt,
 					Local:     loc,
 					Status:    ev.Status,
+					UnitPoint: pt,
 				})
 			}
 			return out, ""
@@ -354,33 +395,130 @@ func parseWoncaCorreiosBytes(data []byte) ([]siteRastreioEvent, string) {
 		obj := nested.Objetos[0]
 		out := make([]siteRastreioEvent, 0, len(obj.Eventos))
 		for _, ev := range obj.Eventos {
+			if strings.TrimSpace(ev.Descricao) == "" && strings.TrimSpace(ev.Detalhe) == "" {
+				continue
+			}
 			out = append(out, mapWoncaCorreiosEvent(ev))
 		}
-		return out, obj.DtPrevista
+		if len(out) > 0 {
+			return out, obj.DtPrevista
+		}
+	}
+	if nested.Payload != nil {
+		if len(nested.Payload.Eventos) > 0 {
+			out := make([]siteRastreioEvent, 0, len(nested.Payload.Eventos))
+			for _, ev := range nested.Payload.Eventos {
+				if strings.TrimSpace(ev.Descricao) == "" && strings.TrimSpace(ev.Detalhe) == "" {
+					continue
+				}
+				out = append(out, mapWoncaCorreiosEvent(ev))
+			}
+			if len(out) > 0 {
+				return out, nested.Payload.DtPrevista
+			}
+		}
+		if len(nested.Payload.Objetos) > 0 && len(nested.Payload.Objetos[0].Eventos) > 0 {
+			obj := nested.Payload.Objetos[0]
+			out := make([]siteRastreioEvent, 0, len(obj.Eventos))
+			for _, ev := range obj.Eventos {
+				if strings.TrimSpace(ev.Descricao) == "" && strings.TrimSpace(ev.Detalhe) == "" {
+					continue
+				}
+				out = append(out, mapWoncaCorreiosEvent(ev))
+			}
+			if len(out) > 0 {
+				return out, obj.DtPrevista
+			}
+		}
 	}
 	return nil, ""
 }
 
 func mapWoncaCorreiosEvent(ev woncaCorreiosEvent) siteRastreioEvent {
-	loc := formatCorreiosLocation(ev.Unidade.Endereco.Cidade, ev.Unidade.Endereco.UF, ev.Unidade.Nome)
-	if loc == "Brasil" && strings.TrimSpace(ev.Unidade.Tipo) != "" {
-		loc = strings.TrimSpace(ev.Unidade.Tipo)
-	}
+	loc, unitPt := extractCorreiosUnitLocation(ev.Unidade)
 	var dest string
+	var destPt *domain.GeoPoint
 	if ev.UnidadeDestino != nil {
-		d := formatCorreiosLocation(ev.UnidadeDestino.Endereco.Cidade, ev.UnidadeDestino.Endereco.UF, ev.UnidadeDestino.Nome)
-		if d != "Brasil" {
+		d, dPt := extractCorreiosUnitLocation(*ev.UnidadeDestino)
+		if d != "" && d != "Brasil" {
 			dest = d
+			destPt = dPt
 		}
 	}
-	return siteRastreioEvent{
-		Codigo:    ev.Codigo,
-		Descricao: ev.Descricao,
-		Detalhe:   ev.Detalhe,
-		Data:      extractFlexibleDate(ev.DtHrCriado),
-		Local:     loc,
-		Destino:   dest,
+	// Se a unidade atual não trouxe cidade específica mas há unidadeDestino (ex: encaminhado para),
+	// preserva o local de origem e anexa o destino para o GeoEnricher resolver a rota.
+	if (loc == "" || loc == "Brasil") && dest != "" {
+		loc = dest
 	}
+	return siteRastreioEvent{
+		Codigo:           ev.Codigo,
+		Descricao:        ev.Descricao,
+		Detalhe:          ev.Detalhe,
+		Data:             extractFlexibleDate(ev.DtHrCriado),
+		Local:            loc,
+		Destino:          dest,
+		UnitPoint:        unitPt,
+		DestinationPoint: destPt,
+	}
+}
+
+func extractCorreiosUnitLocation(u woncaCorreiosUnit) (string, *domain.GeoPoint) {
+	city := strings.TrimSpace(u.Endereco.Cidade)
+	if city == "" {
+		city = strings.TrimSpace(u.Cidade)
+	}
+	uf := strings.TrimSpace(u.Endereco.UF)
+	if uf == "" {
+		uf = strings.TrimSpace(u.UF)
+	}
+	name := strings.TrimSpace(u.Nome)
+	unitType := strings.TrimSpace(u.Tipo)
+	bairro := strings.TrimSpace(u.Endereco.Bairro)
+	logradouro := strings.TrimSpace(u.Endereco.Logradouro)
+	cep := strings.TrimSpace(u.Endereco.CEP)
+
+	loc := formatCorreiosLocation(city, uf, name)
+	if name != "" && city != "" && !strings.Contains(strings.ToLower(loc), strings.ToLower(name)) {
+		loc = name + " - " + loc
+	} else if unitType != "" && city != "" && name == "" {
+		loc = unitType + " - " + loc
+	} else if loc == "Brasil" {
+		switch {
+		case name != "" && uf != "":
+			loc = name + " - " + uf
+		case unitType != "" && bairro != "":
+			loc = unitType + " - " + bairro
+		case unitType != "" && uf != "":
+			loc = unitType + " - " + uf
+		case unitType != "":
+			loc = unitType
+		case bairro != "":
+			loc = bairro
+		}
+	}
+
+	var pt *domain.GeoPoint
+	facilityLabel := name
+	if facilityLabel == "" {
+		facilityLabel = unitType
+	}
+	if city != "" || uf != "" || facilityLabel != "" || logradouro != "" || cep != "" {
+		addr := logradouro
+		if bairro != "" && addr != "" && !strings.Contains(strings.ToLower(addr), strings.ToLower(bairro)) {
+			addr = addr + " - " + bairro
+		} else if addr == "" {
+			addr = bairro
+		}
+		pt = &domain.GeoPoint{
+			City:         city,
+			State:        uf,
+			Address:      addr,
+			ZipCode:      cep,
+			FacilityType: "HUB",
+			FacilityName: facilityLabel,
+		}
+	}
+	return loc, pt
 }
 
 func extractFlexibleDate(raw json.RawMessage) string {
@@ -449,6 +587,12 @@ func mapSiteRastreioEvent(ev siteRastreioEvent) domain.TrackingEvent {
 		loc = "Brasil"
 	}
 
+	var coords *domain.GeoPoint
+	if ev.UnitPoint != nil {
+		cp := *ev.UnitPoint
+		coords = &cp
+	}
+
 	return domain.TrackingEvent{
 		Timestamp:      parseTimestamp(ev.Data),
 		RawStatus:      rawStatus,
@@ -456,6 +600,7 @@ func mapSiteRastreioEvent(ev siteRastreioEvent) domain.TrackingEvent {
 		StandardLabel:  stdLabel,
 		Description:    strings.Join(descParts, " — "),
 		Location:       loc,
+		Coordinates:    coords,
 	}
 }
 
@@ -472,13 +617,15 @@ func normalizeSiteRastreioEstimatedDate(raw string) string {
 }
 
 type siteRastreioEvent struct {
-	Codigo    string `json:"codigo"`
-	Descricao string `json:"descricao"`
-	Detalhe   string `json:"detalhe"`
-	Data      string `json:"data"`
-	Local     string `json:"local"`
-	Destino   string `json:"destino"`
-	Status    string `json:"status"`
+	Codigo           string           `json:"codigo"`
+	Descricao        string           `json:"descricao"`
+	Detalhe          string           `json:"detalhe"`
+	Data             string           `json:"data"`
+	Local            string           `json:"local"`
+	Destino          string           `json:"destino"`
+	Status           string           `json:"status"`
+	UnitPoint        *domain.GeoPoint `json:"-"`
+	DestinationPoint *domain.GeoPoint `json:"-"`
 }
 
 type woncaEvent struct {
@@ -493,19 +640,29 @@ type woncaEvent struct {
 }
 
 type woncaPayload struct {
-	TrackingNumber string       `json:"trackingNumber"`
-	Found          bool         `json:"found"`
-	Delivered      bool         `json:"delivered"`
-	Status         string       `json:"status"`
-	StatusDetail   string       `json:"statusDetail"`
-	LatestUpdate   string       `json:"latestUpdate"`
-	MailingDate    string       `json:"mailingDate"`
-	Events         []woncaEvent `json:"events"`
+	TrackingNumber string               `json:"trackingNumber"`
+	CodObjeto      string               `json:"codObjeto"`
+	DtPrevista     string               `json:"dtPrevista"`
+	Found          bool                 `json:"found"`
+	Delivered      bool                 `json:"delivered"`
+	Status         string               `json:"status"`
+	StatusDetail   string               `json:"statusDetail"`
+	LatestUpdate   string               `json:"latestUpdate"`
+	MailingDate    string               `json:"mailingDate"`
+	Events         []woncaEvent         `json:"events"`
+	Eventos        []woncaCorreiosEvent `json:"eventos"`
+	Objetos        []struct {
+		CodObjeto  string               `json:"codObjeto"`
+		DtPrevista string               `json:"dtPrevista"`
+		Eventos    []woncaCorreiosEvent `json:"eventos"`
+	} `json:"objetos"`
 }
 
 type woncaCorreiosUnit struct {
 	Nome     string `json:"nome"`
 	Tipo     string `json:"tipo"`
+	Cidade   string `json:"cidade"`
+	UF       string `json:"uf"`
 	Endereco struct {
 		Cidade     string `json:"cidade"`
 		UF         string `json:"uf"`
@@ -534,6 +691,7 @@ type woncaCorreiosJSON struct {
 		DtPrevista string               `json:"dtPrevista"`
 		Eventos    []woncaCorreiosEvent `json:"eventos"`
 	} `json:"objetos"`
+	Payload *woncaPayload `json:"payload"`
 }
 
 type siteRastreioResponse struct {

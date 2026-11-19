@@ -20,7 +20,9 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		h.Set("X-XSS-Protection", "1; mode=block")
-		h.Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+		h.Set("Permissions-Policy", "geolocation=(self), microphone=(), camera=()")
+		h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+		h.Set("Cross-Origin-Opener-Policy", "same-origin")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -225,6 +227,16 @@ func (rl *RateLimiter) cleanupLocked(now time.Time) {
 			delete(rl.buckets, ip)
 		}
 	}
+	// Proteção contra exaustão de memória (OOM) caso haja spoofing massivo de IPs
+	const maxTrackedIPs = 10000
+	if len(rl.buckets) > maxTrackedIPs {
+		for ip := range rl.buckets {
+			delete(rl.buckets, ip)
+			if len(rl.buckets) <= maxTrackedIPs/2 {
+				break
+			}
+		}
+	}
 }
 
 // Middleware aplica rate limiting por IP e retorna HTTP 429 com Retry-After quando excedido.
@@ -256,14 +268,15 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 }
 
 func clientIP(r *http.Request) string {
+	// Prioriza X-Real-IP injetado pela borda da Vercel antes de X-Forwarded-For
+	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
+		return xrip
+	}
 	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
 		parts := strings.Split(xff, ",")
 		if len(parts) > 0 && strings.TrimSpace(parts[0]) != "" {
 			return strings.TrimSpace(parts[0])
 		}
-	}
-	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
-		return xrip
 	}
 	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err == nil && host != "" {

@@ -83,7 +83,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	statuses := []domain.ProviderHealth{}
 	if s.tracker != nil {
 		if ps := s.tracker.Statuses(); ps != nil {
-			statuses = ps
+			statuses = make([]domain.ProviderHealth, len(ps))
+			for i, st := range ps {
+				st.LastError = sanitizePublicError(st.LastError)
+				statuses[i] = st
+			}
 		}
 	}
 
@@ -111,10 +115,10 @@ func (s *Server) handleListCarriers(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDetectCarrier(w http.ResponseWriter, r *http.Request) {
 	raw := r.URL.Query().Get("code")
 	code := carrier.SanitizeCode(raw)
-	if len(code) < 3 {
+	if len(code) < 3 || len(code) > 40 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error":   "invalid_tracking_code",
-			"message": "Informe o parâmetro 'code' com um código de rastreio válido.",
+			"message": "Informe o parâmetro 'code' com um código de rastreio válido (3 a 40 caracteres).",
 		})
 		return
 	}
@@ -128,7 +132,7 @@ func (s *Server) handleDetectCarrier(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTrack(w http.ResponseWriter, r *http.Request) {
 	code := carrier.SanitizeCode(r.PathValue("code"))
-	if len(code) < 5 {
+	if len(code) < 5 || len(code) > 40 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error":   "invalid_tracking_code",
 			"message": "Código de rastreio inválido. Verifique o formato e tente novamente.",
@@ -189,9 +193,9 @@ func (s *Server) handleTrack(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		msg := "Não foi possível obter informações de rastreio no momento."
+		msg := "Não foi possível obter informações de rastreio nas transportadoras no momento. Tente novamente em instantes."
 		if err != nil {
-			msg = err.Error()
+			s.logger.Warn("tracking_provider_error", "code", code, "error", err)
 		}
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error":   "tracking_provider_error",
@@ -271,4 +275,18 @@ func parseBoolParam(v string) bool {
 	default:
 		return false
 	}
+}
+
+func sanitizePublicError(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if idx := strings.Index(s, "body="); idx >= 0 {
+		s = strings.TrimSpace(s[:idx])
+	}
+	if len(s) > 120 {
+		s = s[:120] + "..."
+	}
+	return s
 }

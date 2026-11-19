@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -737,7 +738,89 @@ func TestSiteRastreioProvider_WoncaCorreiosNestedJSON(t *testing.T) {
 	if res.CurrentStatus != domain.StatusDelivered || len(res.Events) != 1 {
 		t.Fatalf("unexpected wonca result: status=%q events=%d", res.CurrentStatus, len(res.Events))
 	}
-	if res.Events[0].Location != "SÃO PAULO - SP" {
-		t.Errorf("expected location 'SÃO PAULO - SP', got %q", res.Events[0].Location)
+	if !strings.Contains(res.Events[0].Location, "SÃO PAULO - SP") {
+		t.Errorf("expected location containing 'SÃO PAULO - SP', got %q", res.Events[0].Location)
+	}
+}
+
+func TestSiteRastreioProvider_WoncaPayloadCorreiosEventos(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"carrier": "CARRIER_CORREIOS",
+			"status": "TRACKING_STATUS_FOUND",
+			"payload": {
+				"arEletronico": false,
+				"arImagem": null,
+				"atrasado": false,
+				"autoDeclaracao": false,
+				"bloqueioObjeto": false,
+				"codObjeto": "AP688854277BR",
+				"dtPrevista": "2026-11-24",
+				"eventos": [
+					{
+						"codigo": "RO",
+						"tipo": "01",
+						"dtHrCriado": "2026-11-19T14:20:00",
+						"descricao": "Objeto em trânsito - por favor aguarde",
+						"unidade": {
+							"tipo": "Unidade de Tratamento",
+							"endereco": {
+								"cidade": "INDAIATUBA",
+								"uf": "SP"
+							}
+						},
+						"unidadeDestino": {
+							"tipo": "Unidade de Distribuição",
+							"endereco": {
+								"cidade": "CURITIBA",
+								"uf": "PR"
+							}
+						}
+					},
+					{
+						"codigo": "PO",
+						"tipo": "01",
+						"dtHrCriado": "2026-11-18T10:00:00",
+						"descricao": "Objeto postado",
+						"unidade": {
+							"nome": "AGF Centro",
+							"tipo": "Agência dos Correios",
+							"endereco": {
+								"cidade": "SÃO PAULO",
+								"uf": "SP"
+							}
+						}
+					}
+				]
+			}
+		}`))
+	}))
+	defer srv.Close()
+
+	p := NewSiteRastreioProvider(SiteRastreioConfig{
+		APIKey:         "wonca_live_key",
+		MonthlyCredits: 1000,
+		BaseURL:        srv.URL,
+	})
+
+	res, err := p.Track(context.Background(), "AP688854277BR", carrierpkg.DetectCarrier("AP688854277BR"))
+	if err != nil {
+		t.Fatalf("Track AP688854277BR failed: %v", err)
+	}
+	if len(res.Events) != 2 {
+		t.Fatalf("expected 2 events from payload.eventos, got %d", len(res.Events))
+	}
+	if res.CurrentStatus != domain.StatusInTransit {
+		t.Errorf("expected IN_TRANSIT, got %q", res.CurrentStatus)
+	}
+	if !strings.Contains(res.Events[0].Location, "INDAIATUBA - SP") {
+		t.Errorf("expected latest event location to contain 'INDAIATUBA - SP', got %q", res.Events[0].Location)
+	}
+	if res.Events[0].Coordinates == nil || res.Events[0].Coordinates.City != "INDAIATUBA" {
+		t.Errorf("expected latest event coordinates with City=INDAIATUBA, got %+v", res.Events[0].Coordinates)
+	}
+	if res.Destination == nil || res.Destination.City != "CURITIBA" {
+		t.Errorf("expected destination derived from unidadeDestino (CURITIBA), got %+v", res.Destination)
 	}
 }

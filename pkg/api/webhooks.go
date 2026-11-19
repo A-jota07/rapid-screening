@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -335,6 +336,14 @@ func (s *Server) readAndVerifyWebhookBody(w http.ResponseWriter, r *http.Request
 		return nil, false
 	}
 
+	if s.webhookSecret == "" && isProductionEnv() {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"error":   "webhook_secret_not_configured",
+			"message": "Recebimento de webhooks desabilitado em produção sem WEBHOOK_SECRET configurado.",
+		})
+		return nil, false
+	}
+
 	if s.webhookSecret != "" && !verifyWebhookAuth(r, body, s.webhookSecret) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{
 			"error":   "unauthorized_webhook",
@@ -343,6 +352,10 @@ func (s *Server) readAndVerifyWebhookBody(w http.ResponseWriter, r *http.Request
 		return nil, false
 	}
 	return body, true
+}
+
+func isProductionEnv() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("VERCEL_ENV")), "production")
 }
 
 func verifyWebhookAuth(r *http.Request, body []byte, secret string) bool {

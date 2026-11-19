@@ -769,20 +769,46 @@ export function TrackingMap({ result }: TrackingMapProps) {
                     : 'Assim que a encomenda chegar ao Centro de Distribuição Domiciliária (CDD) local, exibiremos aqui o endereço completo, horário de funcionamento e rota GPS para retirada presencial.'}
                 </p>
 
-                {result.currentLocation && (
+                {(result.currentLocation || result.events?.[0]?.location) && (
                   <div className="rounded-xl border border-[#DCD5C9] bg-[#FCFBF8] p-3.5 text-xs">
                     <span className="block font-semibold text-[#65625A] uppercase">
                       Última unidade registrada
                     </span>
                     <p className="mt-1 text-sm font-bold text-[#23221F]">
-                      {result.currentLocation.facilityName || result.currentLocation.city}
+                      {result.currentLocation?.facilityName ||
+                        result.currentLocation?.city ||
+                        result.events?.[0]?.location}
                     </p>
-                    <p className="mt-0.5 text-[#65625A]">
-                      {result.currentLocation.city}
-                      {result.currentLocation.state
-                        ? `/${result.currentLocation.state}`
-                        : ''}
+                    {result.currentLocation?.address && (
+                      <p className="mt-0.5 text-[#65625A]">{result.currentLocation.address}</p>
+                    )}
+                    {result.currentLocation?.city && (
+                      <p className="mt-0.5 text-[#65625A]">
+                        {result.currentLocation.city}
+                        {result.currentLocation.state
+                          ? `/${result.currentLocation.state}`
+                          : ''}
+                        {result.currentLocation.zipCode
+                          ? ` · CEP ${result.currentLocation.zipCode}`
+                          : ''}
+                      </p>
+                    )}
+                  </div>
+                )}
+                {result.destination && (result.destination.city || result.destination.facilityName) && (
+                  <div className="rounded-xl border border-[#DCD5C9] bg-[#FCFBF8] p-3.5 text-xs">
+                    <span className="block font-semibold text-[#2E5A44] uppercase">
+                      Unidade / Local de Destino
+                    </span>
+                    <p className="mt-1 text-sm font-bold text-[#23221F]">
+                      {result.destination.facilityName || result.destination.city}
                     </p>
+                    {result.destination.city && (
+                      <p className="mt-0.5 text-[#65625A]">
+                        {result.destination.city}
+                        {result.destination.state ? `/${result.destination.state}` : ''}
+                      </p>
+                    )}
                   </div>
                 )}
               </div>
