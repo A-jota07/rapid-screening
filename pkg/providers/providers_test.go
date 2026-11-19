@@ -708,3 +708,36 @@ func TestSiteRastreioProvider_QuotaExhaustionTriggersChainFallback(t *testing.T)
 		t.Errorf("expected siterastreio circuit open & 0 credits, got %+v", st)
 	}
 }
+
+func TestSiteRastreioProvider_WoncaCorreiosNestedJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Apikey wonca_test_key" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		inner := `{"codObjeto":"AA361812099BR","dtPrevista":"13/11/2026","eventos":[{"codigo":"BDE","tipo":"01","dtHrCriado":{"date":"2026-11-12 14:32:08.000000","timezone_type":3,"timezone":"America/Sao_Paulo"},"descricao":"Objeto entregue ao destinatário","unidade":{"tipo":"Unidade de Distribuição","endereco":{"cidade":"SÃO PAULO","uf":"SP"}}}]}`
+		_ = json.NewEncoder(w).Encode(map[string]string{"json": inner})
+	}))
+	defer srv.Close()
+
+	p := NewSiteRastreioProvider(SiteRastreioConfig{
+		APIKey:         "wonca_test_key",
+		MonthlyCredits: 1000,
+		BaseURL:        srv.URL,
+	})
+
+	res, err := p.Track(context.Background(), "AA361812099BR", carrierpkg.DetectCarrier("AA361812099BR"))
+	if err != nil {
+		t.Fatalf("Track failed: %v", err)
+	}
+	if res.CurrentStatus != domain.StatusDelivered || len(res.Events) != 1 {
+		t.Fatalf("unexpected wonca result: status=%q events=%d", res.CurrentStatus, len(res.Events))
+	}
+	if res.Events[0].Location != "SÃO PAULO - SP" {
+		t.Errorf("expected location 'SÃO PAULO - SP', got %q", res.Events[0].Location)
+	}
+}

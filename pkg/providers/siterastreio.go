@@ -20,7 +20,7 @@ const (
 	defaultWoncaBaseURL        = "https://api.wonca.com.br/wonca.labs.v1.LabsService/Track"
 	defaultSiteRastreioBaseURL = "https://seurastreio.com.br/api/public/rastreio"
 	defaultSiteRastreioCredits = 1000
-	defaultSiteRastreioTimeout = 6 * time.Second
+	defaultSiteRastreioTimeout = 10 * time.Second
 	defaultSiteRastreioCircuit = 5 * time.Minute
 )
 
@@ -112,33 +112,45 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 	}
 
 	start := p.state.now()
-	var req *http.Request
-	var err error
-
 	isWonca := strings.Contains(p.baseURL, "wonca.com.br") || !strings.HasPrefix(p.apiKey, "sr_live_")
-	if isWonca && !strings.Contains(p.baseURL, "seurastreio.com.br") {
-		payloadBytes, _ := json.Marshal(map[string]string{"code": cleanCode})
-		req, err = http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL, bytes.NewReader(payloadBytes))
-		if err == nil {
-			req.Header.Set("Authorization", "Apikey "+p.apiKey)
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Accept", "application/json")
+	buildReq := func() (*http.Request, error) {
+		if isWonca && !strings.Contains(p.baseURL, "seurastreio.com.br") {
+			payloadBytes, _ := json.Marshal(map[string]string{"code": cleanCode})
+			r, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL, bytes.NewReader(payloadBytes))
+			if err == nil {
+				r.Header.Set("Authorization", "Apikey "+p.apiKey)
+				r.Header.Set("Content-Type", "application/json")
+				r.Header.Set("Accept", "application/json")
+			}
+			return r, err
 		}
-	} else {
 		endpoint := fmt.Sprintf("%s/%s", p.baseURL, url.PathEscape(cleanCode))
-		req, err = http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		r, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err == nil {
-			req.Header.Set("Authorization", "Bearer "+p.apiKey)
-			req.Header.Set("Accept", "application/json")
+			r.Header.Set("Authorization", "Bearer "+p.apiKey)
+			r.Header.Set("Accept", "application/json")
 		}
-	}
-	if err != nil {
-		p.state.refundCredit()
-		p.state.recordFailure(time.Since(start), err, 0)
-		return nil, fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
+		return r, err
 	}
 
-	resp, err := p.client.Do(req)
+	var resp *http.Response
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		req, reqErr := buildReq()
+		if reqErr != nil {
+			p.state.refundCredit()
+			p.state.recordFailure(time.Since(start), reqErr, 0)
+			return nil, fmt.Errorf("%w: create request: %v", ErrUnavailable, reqErr)
+		}
+		resp, err = p.client.Do(req)
+		if err == nil {
+			break
+		}
+		if attempt == 0 && ctx.Err() == nil {
+			time.Sleep(250 * time.Millisecond)
+			continue
+		}
+	}
 	if err != nil {
 		p.state.refundCredit()
 		wrapped := fmt.Errorf("%w: siterastreio network error: %v", ErrUnavailable, err)
@@ -213,7 +225,7 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 		return nil, parseErr
 	}
 
-	rawEvents := collectSiteRastreioEvents(parsed)
+	rawEvents, estimatedFromNested := collectSiteRastreioEvents(parsed)
 	if (parsed.Success != nil && !*parsed.Success) || len(rawEvents) == 0 {
 		msg := strings.TrimSpace(parsed.Message)
 		if msg == "" {
@@ -236,8 +248,13 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 		events = append(events, mapSiteRastreioEvent(ev))
 	}
 
+	estRaw := parsed.PrevisaoEntrega
+	if estRaw == "" {
+		estRaw = estimatedFromNested
+	}
+
 	result := &domain.TrackingResult{
-		EstimatedDelivery: normalizeSiteRastreioEstimatedDate(parsed.PrevisaoEntrega),
+		EstimatedDelivery: normalizeSiteRastreioEstimatedDate(estRaw),
 		Events:            events,
 	}
 
@@ -246,12 +263,23 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 	return result, nil
 }
 
-func collectSiteRastreioEvents(parsed siteRastreioResponse) []siteRastreioEvent {
+func collectSiteRastreioEvents(parsed siteRastreioResponse) ([]siteRastreioEvent, string) {
+	// 1. Wonca Labs para Correios retorna {"json": "{\"codObjeto\":..., \"eventos\":[...]}"}
+	if strings.TrimSpace(parsed.JSON) != "" {
+		var nested woncaCorreiosJSON
+		if err := json.Unmarshal([]byte(parsed.JSON), &nested); err == nil && len(nested.Eventos) > 0 {
+			out := make([]siteRastreioEvent, 0, len(nested.Eventos))
+			for _, ev := range nested.Eventos {
+				out = append(out, mapWoncaCorreiosEvent(ev))
+			}
+			return out, nested.DtPrevista
+		}
+	}
 	if len(parsed.Historico) > 0 {
-		return parsed.Historico
+		return parsed.Historico, parsed.DtPrevista
 	}
 	if len(parsed.Eventos) > 0 {
-		return parsed.Eventos
+		return parsed.Eventos, parsed.DtPrevista
 	}
 	if parsed.Payload != nil {
 		if len(parsed.Payload.Events) > 0 {
@@ -277,7 +305,7 @@ func collectSiteRastreioEvents(parsed siteRastreioResponse) []siteRastreioEvent 
 					Status:    ev.Status,
 				})
 			}
-			return out
+			return out, ""
 		}
 		if strings.TrimSpace(parsed.Payload.Status) != "" {
 			return []siteRastreioEvent{{
@@ -285,16 +313,61 @@ func collectSiteRastreioEvents(parsed siteRastreioResponse) []siteRastreioEvent 
 				Detalhe:   parsed.Payload.StatusDetail,
 				Data:      parsed.Payload.MailingDate,
 				Status:    parsed.Payload.Status,
-			}}
+			}}, ""
 		}
 	}
 	if parsed.EventoMaisRecente != nil &&
 		(strings.TrimSpace(parsed.EventoMaisRecente.Descricao) != "" ||
 			strings.TrimSpace(parsed.EventoMaisRecente.Status) != "" ||
 			strings.TrimSpace(parsed.EventoMaisRecente.Detalhe) != "") {
-		return []siteRastreioEvent{*parsed.EventoMaisRecente}
+		return []siteRastreioEvent{*parsed.EventoMaisRecente}, ""
 	}
-	return nil
+	return nil, ""
+}
+
+func mapWoncaCorreiosEvent(ev woncaCorreiosEvent) siteRastreioEvent {
+	loc := formatCorreiosLocation(ev.Unidade.Endereco.Cidade, ev.Unidade.Endereco.UF, ev.Unidade.Nome)
+	if loc == "Brasil" && strings.TrimSpace(ev.Unidade.Tipo) != "" {
+		loc = strings.TrimSpace(ev.Unidade.Tipo)
+	}
+	var dest string
+	if ev.UnidadeDestino != nil {
+		d := formatCorreiosLocation(ev.UnidadeDestino.Endereco.Cidade, ev.UnidadeDestino.Endereco.UF, ev.UnidadeDestino.Nome)
+		if d != "Brasil" {
+			dest = d
+		}
+	}
+	return siteRastreioEvent{
+		Codigo:    ev.Codigo,
+		Descricao: ev.Descricao,
+		Detalhe:   ev.Detalhe,
+		Data:      extractFlexibleDate(ev.DtHrCriado),
+		Local:     loc,
+		Destino:   dest,
+	}
+}
+
+func extractFlexibleDate(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return strings.TrimSpace(s)
+	}
+	var obj struct {
+		Date string `json:"date"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		d := strings.TrimSpace(obj.Date)
+		// Remove microssegundos ".000000" para compatibilidade com parseTimestamp
+		if idx := strings.IndexByte(d, '.'); idx > 0 {
+			d = d[:idx]
+		}
+		return d
+	}
+	return ""
 }
 
 func mapSiteRastreioEvent(ev siteRastreioEvent) domain.TrackingEvent {
@@ -394,13 +467,43 @@ type woncaPayload struct {
 	Events         []woncaEvent `json:"events"`
 }
 
+type woncaCorreiosUnit struct {
+	Nome     string `json:"nome"`
+	Tipo     string `json:"tipo"`
+	Endereco struct {
+		Cidade     string `json:"cidade"`
+		UF         string `json:"uf"`
+		Bairro     string `json:"bairro"`
+		Logradouro string `json:"logradouro"`
+		CEP        string `json:"cep"`
+	} `json:"endereco"`
+}
+
+type woncaCorreiosEvent struct {
+	Codigo         string             `json:"codigo"`
+	Tipo           string             `json:"tipo"`
+	DtHrCriado     json.RawMessage    `json:"dtHrCriado"`
+	Descricao      string             `json:"descricao"`
+	Detalhe        string             `json:"detalhe"`
+	Unidade        woncaCorreiosUnit  `json:"unidade"`
+	UnidadeDestino *woncaCorreiosUnit `json:"unidadeDestino"`
+}
+
+type woncaCorreiosJSON struct {
+	CodObjeto  string               `json:"codObjeto"`
+	DtPrevista string               `json:"dtPrevista"`
+	Eventos    []woncaCorreiosEvent `json:"eventos"`
+}
+
 type siteRastreioResponse struct {
+	JSON              string              `json:"json"`
 	Codigo            string              `json:"codigo"`
 	Status            string              `json:"status"`
 	Success           *bool               `json:"success"`
 	Message           string              `json:"message"`
 	Error             string              `json:"error"`
 	PrevisaoEntrega   string              `json:"previsaoEntrega"`
+	DtPrevista        string              `json:"dtPrevista"`
 	EventoMaisRecente *siteRastreioEvent  `json:"eventoMaisRecente"`
 	Historico         []siteRastreioEvent `json:"historico"`
 	Eventos           []siteRastreioEvent `json:"eventos"`
