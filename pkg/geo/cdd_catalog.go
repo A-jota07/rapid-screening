@@ -79,10 +79,16 @@ func (c *CatalogEnricher) Enrich(result *domain.TrackingResult) {
 
 		if ev.Coordinates == nil || !hasValidCoords(ev.Coordinates) {
 			queryLoc := ev.Location
-			if ev.Coordinates != nil {
+			descForResolve := ev.Description
+			if ev.Coordinates != nil && (ev.Coordinates.City != "" || ev.Coordinates.State != "") {
+				// Quando a API já informou cidade/UF explícitas da unidade, não misturar o logradouro
+				// (ex: "Avenida Goiânia" em Rondonópolis/MT) nem a descrição ("Destino: Curitiba/PR").
+				queryLoc = joinNonEmpty(ev.Coordinates.FacilityName, ev.Coordinates.City, ev.Coordinates.State)
+				descForResolve = ""
+			} else if ev.Coordinates != nil {
 				queryLoc = joinNonEmpty(ev.Coordinates.FacilityName, ev.Coordinates.Address, ev.Coordinates.City, ev.Coordinates.State, ev.Location)
 			}
-			if pt := c.ResolveLocation(queryLoc, ev.Description, carrierCode, defaultFacType); pt != nil {
+			if pt := c.ResolveLocation(queryLoc, descForResolve, carrierCode, defaultFacType); pt != nil {
 				if ev.Coordinates != nil {
 					mergeGeoPoint(ev.Coordinates, pt, defaultFacType)
 				} else {
@@ -331,14 +337,11 @@ func (c *CatalogEnricher) enrichCDD(result *domain.TrackingResult, chrono []doma
 		matchedEntry = c.matchBestCatalogEntry(cddCandidateText, carrierCode, true)
 	}
 
-	// Prioridade 2: Destination conhecida.
+	// Prioridade 2: Destination conhecida (apenas correspondência textual na mesma cidade/UF, sem puxar CDD de outro estado).
 	if matchedEntry == nil && result.Destination != nil {
-		destQuery := joinNonEmpty(result.Destination.FacilityName, result.Destination.City, result.Destination.State, result.Destination.Address)
+		destQuery := joinNonEmpty(result.Destination.FacilityName, result.Destination.City, result.Destination.State)
 		if destQuery != "" {
 			matchedEntry = c.matchBestCatalogEntry(destQuery, carrierCode, true)
-		}
-		if matchedEntry == nil && hasValidCoords(result.Destination) && hasCDDSignal {
-			matchedEntry = c.findNearestEntry(result.Destination.Lat, result.Destination.Lng, carrierCode)
 		}
 	}
 
@@ -348,17 +351,42 @@ func (c *CatalogEnricher) enrichCDD(result *domain.TrackingResult, chrono []doma
 		if curQuery != "" {
 			matchedEntry = c.matchBestCatalogEntry(curQuery, carrierCode, true)
 		}
-		if matchedEntry == nil && hasValidCoords(result.CurrentLocation) && hasCDDSignal {
-			matchedEntry = c.findNearestEntry(result.CurrentLocation.Lat, result.CurrentLocation.Lng, carrierCode)
-		}
 	}
 
-	// Prioridade 4: Coordenadas do evento candidato a CDD.
-	if matchedEntry == nil && hasValidCoords(cddCandidateCoords) {
-		matchedEntry = c.findNearestEntry(cddCandidateCoords.Lat, cddCandidateCoords.Lng, carrierCode)
-	}
-
+	// Se não encontrou CDD no catálogo para essa cidade, mas o evento real da transportadora
+	// informou a unidade local (ex: "Unidade de Distribuição - Rondonópolis/MT"), construir CDD real a partir da unidade.
 	if matchedEntry == nil {
+		unitPt := cddCandidateCoords
+		if unitPt == nil || (unitPt.City == "" && unitPt.Lat == 0) {
+			unitPt = result.CurrentLocation
+		}
+		if unitPt != nil && unitPt.City != "" && hasCDDSignal {
+			facName := strings.TrimSpace(unitPt.FacilityName)
+			if facName == "" {
+				facName = "Unidade de Distribuição " + carrierName
+			}
+			if !strings.Contains(strings.ToLower(facName), strings.ToLower(unitPt.City)) {
+				facName = facName + " - " + unitPt.City
+			}
+			addr := strings.TrimSpace(unitPt.Address)
+			if addr == "" {
+				addr = "Centro / Zona Urbana — " + unitPt.City + "/" + unitPt.State
+			}
+			alloc := domain.CDDAllocation{
+				Name:         facName,
+				CarrierName:  carrierName,
+				Address:      addr,
+				City:         unitPt.City,
+				State:        unitPt.State,
+				ZipCode:      unitPt.ZipCode,
+				Phone:        "3003-0100 (Capitais) / 0800 725 7282",
+				OpeningHours: "Seg a Sex 09:00–17:00",
+				Lat:          unitPt.Lat,
+				Lng:          unitPt.Lng,
+			}
+			applyCDDStatusDetails(&alloc, result.CurrentStatus)
+			result.CDD = &alloc
+		}
 		return
 	}
 
@@ -421,12 +449,12 @@ func (c *CatalogEnricher) matchBestCatalogEntry(text, carrierCode string, prefer
 			continue
 		}
 
-		// Validar UF se houver indicação no texto para evitar falsos positivos homônimos.
+		// Validar UF se houver indicação no texto para evitar falsos positivos homônimos (ex: "Avenida Goiânia" em MT).
 		if stateHint != "" {
 			if strings.EqualFold(stateHint, e.State) {
 				score += 15
 			} else {
-				score -= 30
+				continue
 			}
 		}
 
@@ -2207,7 +2235,29 @@ func buildFallbackCities() []cityPoint {
 		{City: "São Luís", State: "MA", Lat: -2.5307, Lng: -44.3068},
 		{City: "Belém", State: "PA", Lat: -1.4558, Lng: -48.4902},
 		{City: "Campo Grande", State: "MS", Lat: -20.4697, Lng: -54.6201},
+		{City: "Dourados", State: "MS", Lat: -22.2231, Lng: -54.8120},
 		{City: "Cuiabá", State: "MT", Lat: -15.6014, Lng: -56.0979},
+		{City: "Várzea Grande", State: "MT", Lat: -15.6458, Lng: -56.1322},
+		{City: "Rondonópolis", State: "MT", Lat: -16.4673, Lng: -54.6372},
+		{City: "Sinop", State: "MT", Lat: -11.8608, Lng: -55.5095},
+		{City: "Wenceslau Braz", State: "PR", Lat: -23.8739, Lng: -49.8033},
+		{City: "Cascavel", State: "PR", Lat: -24.9578, Lng: -53.4595},
+		{City: "Ponta Grossa", State: "PR", Lat: -25.0994, Lng: -50.1583},
+		{City: "Foz do Iguaçu", State: "PR", Lat: -25.5469, Lng: -54.5882},
+		{City: "Anápolis", State: "GO", Lat: -16.3285, Lng: -48.9534},
+		{City: "Aparecida de Goiânia", State: "GO", Lat: -16.8198, Lng: -49.2469},
+		{City: "Bauru", State: "SP", Lat: -22.3145, Lng: -49.0587},
+		{City: "São José do Rio Preto", State: "SP", Lat: -20.8113, Lng: -49.3758},
+		{City: "Piracicaba", State: "SP", Lat: -22.7338, Lng: -47.6476},
+		{City: "Feira de Santana", State: "BA", Lat: -12.2664, Lng: -38.9663},
+		{City: "Vitória da Conquista", State: "BA", Lat: -14.8619, Lng: -40.8444},
+		{City: "Campina Grande", State: "PB", Lat: -7.2247, Lng: -35.8771},
+		{City: "Caruaru", State: "PE", Lat: -8.2845, Lng: -35.9699},
+		{City: "Petrolina", State: "PE", Lat: -9.3891, Lng: -40.5027},
+		{City: "Pelotas", State: "RS", Lat: -31.7654, Lng: -52.3376},
+		{City: "Santa Maria", State: "RS", Lat: -29.6842, Lng: -53.8069},
+		{City: "Montes Claros", State: "MG", Lat: -16.7286, Lng: -43.8578},
+		{City: "Uberaba", State: "MG", Lat: -19.7472, Lng: -47.9381},
 		{City: "Palmas", State: "TO", Lat: -10.2491, Lng: -48.3243},
 	}
 }

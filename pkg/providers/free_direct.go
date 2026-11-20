@@ -16,7 +16,8 @@ import (
 
 const (
 	defaultFreeDirectBaseURL = "https://proxyapp.correios.com.br/v1/sro-rastro"
-	defaultFreeDirectTimeout = 3 * time.Second
+	defaultCainiaoPublicURL  = "https://global.cainiao.com/global/detail.json"
+	defaultFreeDirectTimeout = 4 * time.Second
 	defaultFreeDirectCircuit = 60 * time.Second
 )
 
@@ -92,8 +93,8 @@ func (p *FreeDirectProvider) Track(ctx context.Context, code string, carrierInfo
 	if cleanCode == "" {
 		return nil, fmt.Errorf("%w: empty tracking code", ErrNotFound)
 	}
-	if carrierInfo.Code != "correios" {
-		return nil, fmt.Errorf("%w: free_direct supports only correios", ErrUnsupportedCarrier)
+	if carrierInfo.Code != "correios" && carrierInfo.Code != "cainiao" {
+		return nil, fmt.Errorf("%w: free_direct supports only correios and cainiao", ErrUnsupportedCarrier)
 	}
 
 	if err := p.state.checkReady(); err != nil {
@@ -103,6 +104,17 @@ func (p *FreeDirectProvider) Track(ctx context.Context, code string, carrierInfo
 	start := time.Now()
 	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
+
+	// Se for Cainiao puro e usando URL padrão, vai direto no endpoint público global da Cainiao.
+	if carrierInfo.Code == "cainiao" && p.baseURL == defaultFreeDirectBaseURL {
+		if res, cErr := p.trackViaCainiaoPublic(reqCtx, cleanCode, carrierInfo); cErr == nil && res != nil {
+			p.state.recordSuccess(time.Since(start))
+			return res, nil
+		} else {
+			p.state.recordFailure(time.Since(start), cErr, 0)
+			return nil, cErr
+		}
+	}
 
 	endpoint := fmt.Sprintf("%s/%s", p.baseURL, cleanCode)
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
@@ -115,6 +127,12 @@ func (p *FreeDirectProvider) Track(ctx context.Context, code string, carrierInfo
 
 	resp, err := p.client.Do(req)
 	if err != nil {
+		if p.baseURL == defaultFreeDirectBaseURL {
+			if res, cErr := p.trackViaCainiaoPublic(reqCtx, cleanCode, carrierInfo); cErr == nil && res != nil {
+				p.state.recordSuccess(time.Since(start))
+				return res, nil
+			}
+		}
 		p.state.recordFailure(time.Since(start), err, p.circuitDuration)
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
@@ -124,6 +142,13 @@ func (p *FreeDirectProvider) Track(ctx context.Context, code string, carrierInfo
 	if err != nil {
 		p.state.recordFailure(time.Since(start), err, p.circuitDuration)
 		return nil, fmt.Errorf("%w: failed reading response: %v", ErrUnavailable, err)
+	}
+
+	if resp.StatusCode != http.StatusOK && p.baseURL == defaultFreeDirectBaseURL {
+		if res, cErr := p.trackViaCainiaoPublic(reqCtx, cleanCode, carrierInfo); cErr == nil && res != nil {
+			p.state.recordSuccess(time.Since(start))
+			return res, nil
+		}
 	}
 
 	if resp.StatusCode == http.StatusNotFound {
@@ -221,6 +246,79 @@ func (p *FreeDirectProvider) Track(ctx context.Context, code string, carrierInfo
 	}
 
 	p.state.recordSuccess(time.Since(start))
+	return result, nil
+}
+
+func (p *FreeDirectProvider) trackViaCainiaoPublic(ctx context.Context, cleanCode string, carrierInfo domain.CarrierInfo) (*domain.TrackingResult, error) {
+	endpoint := fmt.Sprintf("%s?mailNos=%s&lang=pt-BR", defaultCainiaoPublicURL, cleanCode)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; rapid-screening/1.0)")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: cainiao network error: %v", ErrUnavailable, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: cainiao HTTP %d", ErrUnavailable, resp.StatusCode)
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return nil, fmt.Errorf("%w: cainiao read body: %v", ErrUnavailable, err)
+	}
+
+	evs, est, msg, fail := parseFlexibleSiteRastreioPayload(raw)
+	if fail || len(evs) == 0 {
+		var cainiaoResp struct {
+			Module []struct {
+				DetailList []struct {
+					Time         string `json:"time"`
+					Desc         string `json:"desc"`
+					StanderdDesc string `json:"standerdDesc"`
+					ActionCode   string `json:"actionCode"`
+				} `json:"detailList"`
+			} `json:"module"`
+		}
+		if err := json.Unmarshal(raw, &cainiaoResp); err == nil && len(cainiaoResp.Module) > 0 && len(cainiaoResp.Module[0].DetailList) > 0 {
+			for _, d := range cainiaoResp.Module[0].DetailList {
+				desc := strings.TrimSpace(d.Desc)
+				if desc == "" {
+					desc = strings.TrimSpace(d.StanderdDesc)
+				}
+				if desc == "" {
+					continue
+				}
+				evs = append(evs, siteRastreioEvent{
+					Codigo:    d.ActionCode,
+					Descricao: desc,
+					Detalhe:   d.StanderdDesc,
+					Data:      d.Time,
+					Local:     "Brasil",
+				})
+			}
+		}
+	}
+
+	if len(evs) == 0 {
+		return nil, fmt.Errorf("%w: cainiao no events (%s)", ErrNotFound, msg)
+	}
+
+	events := make([]domain.TrackingEvent, 0, len(evs))
+	for _, ev := range evs {
+		events = append(events, mapSiteRastreioEvent(ev))
+	}
+
+	result := &domain.TrackingResult{
+		EstimatedDelivery: normalizeSiteRastreioEstimatedDate(est),
+		Events:            events,
+	}
+	finalizeTrackingResult(result, cleanCode, carrierInfo, p.Name(), time.Now())
 	return result, nil
 }
 

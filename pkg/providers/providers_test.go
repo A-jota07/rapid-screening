@@ -420,8 +420,11 @@ func TestNewDefaultChain_OfflineWithoutAPIKeys(t *testing.T) {
 			t.Errorf("prodStatuses[%d].Name = %q; want %q", i, prodStatuses[i].Name, wantName)
 		}
 	}
-	if _, err := prodChain.Track(context.Background(), "MND994827162BR", domain.CarrierInfo{}); err == nil {
-		t.Fatal("expected error in production mode when no real provider is configured")
+	if _, err := prodChain.Track(context.Background(), "BR998877665544X", domain.CarrierInfo{}); err == nil {
+		t.Fatal("expected error in production mode when a non-sample code has no real provider configured")
+	}
+	if sampleRes, err := prodChain.Track(context.Background(), "MND994827162BR", domain.CarrierInfo{}); err != nil || sampleRes == nil {
+		t.Fatalf("expected explicit UI sample chip MND994827162BR to work, got err=%v", err)
 	}
 
 	// 2. Modo demo explícito (DEMO_FALLBACK_ENABLED=true): inclui smart_demo_fallback.
@@ -822,5 +825,36 @@ func TestSiteRastreioProvider_WoncaPayloadCorreiosEventos(t *testing.T) {
 	}
 	if res.Destination == nil || res.Destination.City != "CURITIBA" {
 		t.Errorf("expected destination derived from unidadeDestino (CURITIBA), got %+v", res.Destination)
+	}
+}
+
+func TestSiteRastreioProvider_PHPEmptyArraysAndDateTimeObjects(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Simula exatamente o json_encode do PHP no Wonca Labs quando unidadeDestino ou endereco vêm como []
+		// e dtPrevista vem como objeto DateTime {"date": "..."}.
+		inner := `{"codObjeto":"NM123456789BR","dtPrevista":{"date":"2026-11-28 00:00:00.000000","timezone_type":3,"timezone":"America/Sao_Paulo"},"eventos":[{"codigo":"OEC","tipo":1,"dtHrCriado":{"date":"2026-11-20 09:15:00.000000","timezone_type":3,"timezone":"America/Sao_Paulo"},"descricao":"Objeto saiu para entrega ao destinatário","detalhe":[],"unidade":{"tipo":"Unidade de Distribuição","endereco":{"cidade":"RONDONOPOLIS","uf":"MT","logradouro":"AVENIDA GOIANIA"}} ,"unidadeDestino":[]},{"codigo":"PAR","tipo":1,"dtHrCriado":"2026-11-15 11:00:00","descricao":"Objeto recebido pelos Correios do Brasil","unidade":{"tipo":"País","endereco":[]},"unidadeDestino":[]}]}`
+		_ = json.NewEncoder(w).Encode(map[string]any{"json": inner})
+	}))
+	defer srv.Close()
+
+	p := NewSiteRastreioProvider(SiteRastreioConfig{
+		APIKey:         "wonca_php_test",
+		MonthlyCredits: 1000,
+		BaseURL:        srv.URL,
+	})
+
+	res, err := p.Track(context.Background(), "NM123456789BR", carrierpkg.DetectCarrier("NM123456789BR"))
+	if err != nil {
+		t.Fatalf("expected PHP empty array payload to parse cleanly, got error: %v", err)
+	}
+	if len(res.Events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(res.Events))
+	}
+	if res.CurrentStatus != domain.StatusOutForDelivery {
+		t.Errorf("expected OUT_FOR_DELIVERY, got %s", res.CurrentStatus)
+	}
+	if res.EstimatedDelivery != "2026-11-28" {
+		t.Errorf("expected EstimatedDelivery 2026-11-28, got %q", res.EstimatedDelivery)
 	}
 }

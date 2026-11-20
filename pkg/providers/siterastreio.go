@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,7 +25,7 @@ const (
 	defaultSiteRastreioCircuit = 5 * time.Minute
 )
 
-// SiteRastreioConfig configura o provedor Site Rastreio / Seu Rastreio (cota gratuita mensal de 1.000 req/mês).
+// SiteRastreioConfig configura o provedor Site Rastreio / Wonca Labs (cota gratuita mensal de 1.000 req/mês).
 type SiteRastreioConfig struct {
 	APIKey          string
 	MonthlyCredits  int
@@ -33,8 +34,8 @@ type SiteRastreioConfig struct {
 	CircuitDuration time.Duration
 }
 
-// SiteRastreioProvider integra com a API REST pública do ecossistema Site Rastreio / Seu Rastreio
-// usando autenticação Bearer Token ("Authorization: Bearer sr_live_...").
+// SiteRastreioProvider integra com a API REST do Wonca Labs (labs.wonca.com.br / siterastreio.com.br)
+// e também suporta o formato Seu Rastreio ("sr_live_...").
 type SiteRastreioProvider struct {
 	state           *providerState
 	apiKey          string
@@ -43,12 +44,15 @@ type SiteRastreioProvider struct {
 	circuitDuration time.Duration
 }
 
-// NewSiteRastreioProviderFromEnv instancia o provedor lendo SITERASTREIO_API_KEY (ou SEURASTREIO_API_KEY)
+// NewSiteRastreioProviderFromEnv instancia o provedor lendo SITERASTREIO_API_KEY (ou SEURASTREIO_API_KEY / WONCA_API_KEY)
 // e SITERASTREIO_MONTHLY_CREDITS (default 1000).
 func NewSiteRastreioProviderFromEnv() *SiteRastreioProvider {
 	apiKey := strings.TrimSpace(os.Getenv("SITERASTREIO_API_KEY"))
 	if apiKey == "" {
 		apiKey = strings.TrimSpace(os.Getenv("SEURASTREIO_API_KEY"))
+	}
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("WONCA_API_KEY"))
 	}
 	credits := parseEnvInt("SITERASTREIO_MONTHLY_CREDITS", defaultSiteRastreioCredits)
 	baseURL := strings.TrimSpace(os.Getenv("SITERASTREIO_BASE_URL"))
@@ -112,133 +116,51 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 	}
 
 	start := p.state.now()
-	isWonca := strings.Contains(p.baseURL, "wonca.com.br") || !strings.HasPrefix(p.apiKey, "sr_live_")
-	buildReq := func() (*http.Request, error) {
-		if isWonca && !strings.Contains(p.baseURL, "seurastreio.com.br") {
-			payloadBytes, _ := json.Marshal(map[string]string{"code": cleanCode})
-			r, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL, bytes.NewReader(payloadBytes))
-			if err == nil {
-				r.Header.Set("Authorization", "Apikey "+p.apiKey)
-				r.Header.Set("Content-Type", "application/json")
-				r.Header.Set("Accept", "application/json")
-			}
-			return r, err
-		}
-		endpoint := fmt.Sprintf("%s/%s", p.baseURL, url.PathEscape(cleanCode))
-		r, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-		if err == nil {
-			r.Header.Set("Authorization", "Bearer "+p.apiKey)
-			r.Header.Set("Accept", "application/json")
-		}
-		return r, err
-	}
+	isWonca := (strings.Contains(p.baseURL, "wonca.com.br") || !strings.HasPrefix(p.apiKey, "sr_live_")) &&
+		!strings.Contains(p.baseURL, "seurastreio.com.br")
 
-	var resp *http.Response
-	var err error
-	for attempt := 0; attempt < 2; attempt++ {
-		req, reqErr := buildReq()
-		if reqErr != nil {
-			p.state.refundCredit()
-			p.state.recordFailure(time.Since(start), reqErr, 0)
-			return nil, fmt.Errorf("%w: create request: %v", ErrUnavailable, reqErr)
-		}
-		resp, err = p.client.Do(req)
-		if err == nil {
-			break
-		}
-		if attempt == 0 && ctx.Err() == nil {
-			time.Sleep(250 * time.Millisecond)
-			continue
-		}
-	}
+	rawBody, statusCode, err := p.doRequestWithRetry(ctx, cleanCode, "", isWonca)
 	if err != nil {
 		p.state.refundCredit()
 		wrapped := fmt.Errorf("%w: siterastreio network error: %v", ErrUnavailable, err)
 		p.state.recordFailure(time.Since(start), wrapped, 0)
 		return nil, wrapped
 	}
-	defer resp.Body.Close()
 
-	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	if err != nil {
-		p.state.refundCredit()
-		wrapped := fmt.Errorf("%w: siterastreio read body: %v", ErrUnavailable, err)
-		p.state.recordFailure(time.Since(start), wrapped, 0)
-		return nil, wrapped
+	if res, done, err := p.handleHTTPStatus(start, statusCode, rawBody); done {
+		return res, err
 	}
 
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		p.state.refundCredit()
-		authErr := fmt.Errorf("%w: siterastreio unauthorized HTTP %d", ErrUnavailable, resp.StatusCode)
-		p.state.recordFailure(time.Since(start), authErr, p.circuitDuration)
-		return nil, authErr
+	rawEvents, estRaw, extractedMsg,explicitFail := parseFlexibleSiteRastreioPayload(rawBody)
+
+	// Se for Wonca Labs e a chamada sem "carrier" retornou vazio, tenta novamente informando o enum "carrier" da transportadora.
+	if isWonca && len(rawEvents) == 0 && !explicitFail {
+		if woncaCarrier := mapCarrierToWoncaEnum(carrierInfo.Code); woncaCarrier != "" {
+			if retryBody, retryStatus, retryErr := p.doRequestWithRetry(ctx, cleanCode, woncaCarrier, true); retryErr == nil && retryStatus == http.StatusOK {
+				if evs2, est2, msg2, _ := parseFlexibleSiteRastreioPayload(retryBody); len(evs2) > 0 {
+					rawEvents = evs2
+					if est2 != "" {
+						estRaw = est2
+					}
+					if msg2 != "" {
+						extractedMsg = msg2
+					}
+					rawBody = retryBody
+				}
+			}
+		}
 	}
 
-	if resp.StatusCode == http.StatusPaymentRequired {
-		p.state.exhaustCredits()
-		quotaErr := fmt.Errorf("%w: siterastreio HTTP 402 subscription/quota required", ErrNoCredits)
-		p.state.recordFailure(time.Since(start), quotaErr, p.circuitDuration)
-		return nil, quotaErr
-	}
-
-	if resp.StatusCode == http.StatusTooManyRequests {
-		bodyStr := string(rawBody)
-		lower := strings.ToLower(bodyStr)
-		if strings.Contains(lower, "mensal") || strings.Contains(lower, "monthly") || strings.Contains(lower, "quota") || strings.Contains(lower, "cota") {
+	if explicitFail || len(rawEvents) == 0 {
+		if isQuotaOrRateError(200, extractedMsg) {
 			p.state.exhaustCredits()
-			quotaErr := fmt.Errorf("%w: siterastreio HTTP 429 monthly quota exhausted", ErrNoCredits)
+			quotaErr := fmt.Errorf("%w: siterastreio quota message: %s", ErrNoCredits, extractedMsg)
 			p.state.recordFailure(time.Since(start), quotaErr, p.circuitDuration)
 			return nil, quotaErr
 		}
 		p.state.refundCredit()
-		rateErr := fmt.Errorf("%w: siterastreio HTTP 429 rate limit", ErrUnavailable)
-		p.state.recordFailure(time.Since(start), rateErr, p.circuitDuration)
-		return nil, rateErr
-	}
-
-	if resp.StatusCode == http.StatusNotFound {
-		p.state.refundCredit()
-		notFoundErr := fmt.Errorf("%w: siterastreio HTTP 404 tracking not found", ErrNotFound)
-		p.state.recordFailure(time.Since(start), notFoundErr, 0)
-		return nil, notFoundErr
-	}
-
-	if resp.StatusCode >= 500 {
-		p.state.refundCredit()
-		srvErr := fmt.Errorf("%w: siterastreio HTTP %d", ErrUnavailable, resp.StatusCode)
-		p.state.recordFailure(time.Since(start), srvErr, p.circuitDuration)
-		return nil, srvErr
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		p.state.refundCredit()
-		unexpectedErr := fmt.Errorf("%w: siterastreio unexpected HTTP %d: %s", ErrUnavailable, resp.StatusCode, strings.TrimSpace(string(rawBody)))
-		p.state.recordFailure(time.Since(start), unexpectedErr, 0)
-		return nil, unexpectedErr
-	}
-
-	var parsed siteRastreioResponse
-	if err := json.Unmarshal(rawBody, &parsed); err != nil {
-		p.state.refundCredit()
-		parseErr := fmt.Errorf("%w: siterastreio invalid JSON: %v", ErrUnavailable, err)
-		p.state.recordFailure(time.Since(start), parseErr, 0)
-		return nil, parseErr
-	}
-
-	rawEvents, estimatedFromNested := collectSiteRastreioEvents(parsed, rawBody)
-	if (parsed.Success != nil && !*parsed.Success) || len(rawEvents) == 0 {
-		msg := strings.TrimSpace(parsed.Message)
-		if msg == "" {
-			msg = strings.TrimSpace(parsed.Error)
-		}
-		if isQuotaOrRateError(200, msg) {
-			p.state.exhaustCredits()
-			quotaErr := fmt.Errorf("%w: siterastreio quota message: %s", ErrNoCredits, msg)
-			p.state.recordFailure(time.Since(start), quotaErr, p.circuitDuration)
-			return nil, quotaErr
-		}
-		p.state.refundCredit()
-		notFoundErr := fmt.Errorf("%w: siterastreio no events (%s)", ErrNotFound, msg)
+		diag := summarizeJSONShape(rawBody, extractedMsg)
+		notFoundErr := fmt.Errorf("%w: siterastreio no events (%s)", ErrNotFound, diag)
 		p.state.recordFailure(time.Since(start), notFoundErr, 0)
 		return nil, notFoundErr
 	}
@@ -246,11 +168,6 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 	events := make([]domain.TrackingEvent, 0, len(rawEvents))
 	for _, ev := range rawEvents {
 		events = append(events, mapSiteRastreioEvent(ev))
-	}
-
-	estRaw := parsed.PrevisaoEntrega
-	if estRaw == "" {
-		estRaw = estimatedFromNested
 	}
 
 	result := &domain.TrackingResult{
@@ -272,194 +189,555 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 	return result, nil
 }
 
-func collectSiteRastreioEvents(parsed siteRastreioResponse, rawBody []byte) ([]siteRastreioEvent, string) {
-	// 1. Wonca Labs para Correios retorna {"json": "{\"codObjeto\":..., \"eventos\":[...]}"} ou {"json": {...}}
-	if len(parsed.JSON) > 0 && string(parsed.JSON) != "null" {
-		innerBytes := parsed.JSON
-		var asString string
-		if err := json.Unmarshal(parsed.JSON, &asString); err == nil && strings.TrimSpace(asString) != "" {
-			innerBytes = []byte(asString)
-		}
-		if evs, est := parseWoncaCorreiosBytes(innerBytes); len(evs) > 0 {
-			return evs, est
-		}
-	}
-	// 2. Correios SRO / Wonca direto na raiz (eventos com unidade/dtHrCriado, objetos[0].eventos ou payload.eventos)
-	if evs, est := parseWoncaCorreiosBytes(rawBody); len(evs) > 0 {
-		return evs, est
-	}
-	if len(parsed.Historico) > 0 {
-		return parsed.Historico, parsed.DtPrevista
-	}
-	if len(parsed.Eventos) > 0 {
-		return parsed.Eventos, parsed.DtPrevista
-	}
-	if parsed.Payload != nil {
-		if len(parsed.Payload.Eventos) > 0 {
-			out := make([]siteRastreioEvent, 0, len(parsed.Payload.Eventos))
-			for _, ev := range parsed.Payload.Eventos {
-				if strings.TrimSpace(ev.Descricao) == "" && strings.TrimSpace(ev.Detalhe) == "" {
-					continue
-				}
-				out = append(out, mapWoncaCorreiosEvent(ev))
+func (p *SiteRastreioProvider) doRequestWithRetry(ctx context.Context, cleanCode, woncaCarrier string, isWonca bool) ([]byte, int, error) {
+	buildReq := func() (*http.Request, error) {
+		if isWonca {
+			bodyMap := map[string]string{"code": cleanCode}
+			if woncaCarrier != "" {
+				bodyMap["carrier"] = woncaCarrier
 			}
-			if len(out) > 0 {
-				return out, parsed.Payload.DtPrevista
+			payloadBytes, _ := json.Marshal(bodyMap)
+			r, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL, bytes.NewReader(payloadBytes))
+			if err == nil {
+				r.Close = true
+				r.Header.Set("Authorization", "Apikey "+p.apiKey)
+				r.Header.Set("Content-Type", "application/json")
+				r.Header.Set("Accept", "application/json")
+				r.Header.Set("User-Agent", "rapid-screening/1.0")
 			}
+			return r, err
 		}
-		if len(parsed.Payload.Objetos) > 0 && len(parsed.Payload.Objetos[0].Eventos) > 0 {
-			obj := parsed.Payload.Objetos[0]
-			out := make([]siteRastreioEvent, 0, len(obj.Eventos))
-			for _, ev := range obj.Eventos {
-				if strings.TrimSpace(ev.Descricao) == "" && strings.TrimSpace(ev.Detalhe) == "" {
-					continue
-				}
-				out = append(out, mapWoncaCorreiosEvent(ev))
-			}
-			if len(out) > 0 {
-				return out, obj.DtPrevista
-			}
+		endpoint := fmt.Sprintf("%s/%s", p.baseURL, url.PathEscape(cleanCode))
+		r, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err == nil {
+			r.Close = true
+			r.Header.Set("Authorization", "Bearer "+p.apiKey)
+			r.Header.Set("Accept", "application/json")
+			r.Header.Set("User-Agent", "rapid-screening/1.0")
 		}
-		if len(parsed.Payload.Events) > 0 {
-			out := make([]siteRastreioEvent, 0, len(parsed.Payload.Events))
-			for _, ev := range parsed.Payload.Events {
-				loc := strings.TrimSpace(ev.Location)
-				if loc == "" && ev.City != "" {
-					if ev.State != "" {
-						loc = ev.City + "/" + ev.State
-					} else {
-						loc = ev.City
-					}
-				}
-				dt := strings.TrimSpace(ev.Date)
-				if dt != "" && strings.TrimSpace(ev.Time) != "" {
-					dt = dt + "T" + strings.TrimSpace(ev.Time)
-				}
-				var pt *domain.GeoPoint
-				if ev.City != "" || ev.State != "" || loc != "" {
-					pt = &domain.GeoPoint{
-						City:         strings.TrimSpace(ev.City),
-						State:        strings.TrimSpace(ev.State),
-						ZipCode:      strings.TrimSpace(ev.Zip),
-						FacilityType: "HUB",
-						FacilityName: loc,
-					}
-				}
-				out = append(out, siteRastreioEvent{
-					Descricao: ev.Status,
-					Detalhe:   ev.StatusDetail,
-					Data:      dt,
-					Local:     loc,
-					Status:    ev.Status,
-					UnitPoint: pt,
-				})
-			}
-			return out, ""
-		}
-		if strings.TrimSpace(parsed.Payload.Status) != "" {
-			return []siteRastreioEvent{{
-				Descricao: parsed.Payload.Status,
-				Detalhe:   parsed.Payload.StatusDetail,
-				Data:      parsed.Payload.MailingDate,
-				Status:    parsed.Payload.Status,
-			}}, ""
-		}
+		return r, err
 	}
-	if parsed.EventoMaisRecente != nil &&
-		(strings.TrimSpace(parsed.EventoMaisRecente.Descricao) != "" ||
-			strings.TrimSpace(parsed.EventoMaisRecente.Status) != "" ||
-			strings.TrimSpace(parsed.EventoMaisRecente.Detalhe) != "") {
-		return []siteRastreioEvent{*parsed.EventoMaisRecente}, ""
-	}
-	return nil, ""
-}
 
-func parseWoncaCorreiosBytes(data []byte) ([]siteRastreioEvent, string) {
-	var nested woncaCorreiosJSON
-	if err := json.Unmarshal(data, &nested); err != nil {
-		return nil, ""
-	}
-	if len(nested.Eventos) > 0 {
-		out := make([]siteRastreioEvent, 0, len(nested.Eventos))
-		for _, ev := range nested.Eventos {
-			if strings.TrimSpace(ev.Descricao) == "" && strings.TrimSpace(ev.Detalhe) == "" {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		req, reqErr := buildReq()
+		if reqErr != nil {
+			return nil, 0, reqErr
+		}
+		resp, err := p.client.Do(req)
+		if err != nil {
+			lastErr = err
+			p.client.CloseIdleConnections()
+			if attempt < 2 && ctx.Err() == nil {
+				time.Sleep(time.Duration(attempt+1) * 250 * time.Millisecond)
 				continue
 			}
-			out = append(out, mapWoncaCorreiosEvent(ev))
+			return nil, 0, lastErr
 		}
-		if len(out) > 0 {
-			return out, nested.DtPrevista
-		}
-	}
-	if len(nested.Objetos) > 0 && len(nested.Objetos[0].Eventos) > 0 {
-		obj := nested.Objetos[0]
-		out := make([]siteRastreioEvent, 0, len(obj.Eventos))
-		for _, ev := range obj.Eventos {
-			if strings.TrimSpace(ev.Descricao) == "" && strings.TrimSpace(ev.Detalhe) == "" {
+		rawBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			p.client.CloseIdleConnections()
+			if attempt < 2 && ctx.Err() == nil {
+				time.Sleep(time.Duration(attempt+1) * 250 * time.Millisecond)
 				continue
 			}
-			out = append(out, mapWoncaCorreiosEvent(ev))
+			return nil, 0, lastErr
 		}
-		if len(out) > 0 {
-			return out, obj.DtPrevista
-		}
+		return rawBody, resp.StatusCode, nil
 	}
-	if nested.Payload != nil {
-		if len(nested.Payload.Eventos) > 0 {
-			out := make([]siteRastreioEvent, 0, len(nested.Payload.Eventos))
-			for _, ev := range nested.Payload.Eventos {
-				if strings.TrimSpace(ev.Descricao) == "" && strings.TrimSpace(ev.Detalhe) == "" {
-					continue
-				}
-				out = append(out, mapWoncaCorreiosEvent(ev))
-			}
-			if len(out) > 0 {
-				return out, nested.Payload.DtPrevista
-			}
-		}
-		if len(nested.Payload.Objetos) > 0 && len(nested.Payload.Objetos[0].Eventos) > 0 {
-			obj := nested.Payload.Objetos[0]
-			out := make([]siteRastreioEvent, 0, len(obj.Eventos))
-			for _, ev := range obj.Eventos {
-				if strings.TrimSpace(ev.Descricao) == "" && strings.TrimSpace(ev.Detalhe) == "" {
-					continue
-				}
-				out = append(out, mapWoncaCorreiosEvent(ev))
-			}
-			if len(out) > 0 {
-				return out, obj.DtPrevista
-			}
-		}
-	}
-	return nil, ""
+	return nil, 0, lastErr
 }
 
-func mapWoncaCorreiosEvent(ev woncaCorreiosEvent) siteRastreioEvent {
-	loc, unitPt := extractCorreiosUnitLocation(ev.Unidade)
+func (p *SiteRastreioProvider) handleHTTPStatus(start time.Time, statusCode int, rawBody []byte) (*domain.TrackingResult, bool, error) {
+	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+		p.state.refundCredit()
+		authErr := fmt.Errorf("%w: siterastreio unauthorized HTTP %d", ErrUnavailable, statusCode)
+		p.state.recordFailure(time.Since(start), authErr, p.circuitDuration)
+		return nil, true, authErr
+	}
+
+	if statusCode == http.StatusPaymentRequired {
+		p.state.exhaustCredits()
+		quotaErr := fmt.Errorf("%w: siterastreio HTTP 402 subscription/quota required", ErrNoCredits)
+		p.state.recordFailure(time.Since(start), quotaErr, p.circuitDuration)
+		return nil, true, quotaErr
+	}
+
+	if statusCode == http.StatusTooManyRequests {
+		lower := strings.ToLower(string(rawBody))
+		if strings.Contains(lower, "mensal") || strings.Contains(lower, "monthly") || strings.Contains(lower, "quota") || strings.Contains(lower, "cota") {
+			p.state.exhaustCredits()
+			quotaErr := fmt.Errorf("%w: siterastreio HTTP 429 monthly quota exhausted", ErrNoCredits)
+			p.state.recordFailure(time.Since(start), quotaErr, p.circuitDuration)
+			return nil, true, quotaErr
+		}
+		p.state.refundCredit()
+		rateErr := fmt.Errorf("%w: siterastreio HTTP 429 rate limit", ErrUnavailable)
+		p.state.recordFailure(time.Since(start), rateErr, p.circuitDuration)
+		return nil, true, rateErr
+	}
+
+	if statusCode == http.StatusNotFound {
+		p.state.refundCredit()
+		notFoundErr := fmt.Errorf("%w: siterastreio HTTP 404 tracking not found", ErrNotFound)
+		p.state.recordFailure(time.Since(start), notFoundErr, 0)
+		return nil, true, notFoundErr
+	}
+
+	if statusCode >= 500 {
+		p.state.refundCredit()
+		srvErr := fmt.Errorf("%w: siterastreio HTTP %d", ErrUnavailable, statusCode)
+		p.state.recordFailure(time.Since(start), srvErr, p.circuitDuration)
+		return nil, true, srvErr
+	}
+
+	if statusCode != http.StatusOK {
+		p.state.refundCredit()
+		unexpectedErr := fmt.Errorf("%w: siterastreio unexpected HTTP %d", ErrUnavailable, statusCode)
+		p.state.recordFailure(time.Since(start), unexpectedErr, 0)
+		return nil, true, unexpectedErr
+	}
+
+	return nil, false, nil
+}
+
+func mapCarrierToWoncaEnum(code string) string {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "correios":
+		return "CARRIER_CORREIOS"
+	case "cainiao":
+		return "CARRIER_CAINIAO"
+	case "jt_express":
+		return "CARRIER_JT"
+	case "total_express":
+		return "CARRIER_TOTAL_EXPRESS"
+	default:
+		return ""
+	}
+}
+
+// parseFlexibleSiteRastreioPayload decodifica respostas do Wonca Labs e Site Rastreio / Seu Rastreio
+// usando map[string]any para tolerar arrays PHP vazios (ex: "endereco": [], "unidadeDestino": []),
+// objetos DateTime do PHP (ex: "dtHrCriado": {"date": "..."}, "dtPrevista": {"date": "..."}) e strings JSON aninhadas.
+func parseFlexibleSiteRastreioPayload(rawBody []byte) (events []siteRastreioEvent, estimated string, message string, explicitFail bool) {
+	var root any
+	if err := json.Unmarshal(rawBody, &root); err != nil {
+		return nil, "", "invalid JSON: " + err.Error(), true
+	}
+
+	rootMap, ok := root.(map[string]any)
+	if !ok {
+		if arr, isArr := root.([]any); isArr {
+			for _, item := range arr {
+				if m, ok := item.(map[string]any); ok {
+					evs, est, msg := extractFromObjectMap(m)
+					if len(evs) > 0 {
+						return evs, est, msg, false
+					}
+				}
+			}
+		}
+		return nil, "", "unexpected root JSON type", false
+	}
+
+	if succ, exists := rootMap["success"]; exists {
+		if b, isBool := succ.(bool); isBool && !b {
+			explicitFail = true
+		}
+	}
+
+	events, estimated, message = extractFromObjectMap(rootMap)
+	return events, estimated, message, explicitFail
+}
+
+func extractFromObjectMap(m map[string]any) (events []siteRastreioEvent, estimated string, message string) {
+	if m == nil {
+		return nil, "", ""
+	}
+
+	message = firstNonEmptyStr(
+		anyToString(m["message"]),
+		anyToString(m["mensagem"]),
+		anyToString(m["error"]),
+		anyToString(m["msg"]),
+	)
+	estimated = firstNonEmptyStr(
+		extractDateAny(m["previsaoEntrega"]),
+		extractDateAny(m["dtPrevista"]),
+		extractDateAny(m["estimatedDelivery"]),
+	)
+
+	// 1. Campo "json" (Wonca Labs costuma retornar string JSON ou objeto JSON dentro de "json").
+	if rawJSON, exists := m["json"]; exists && rawJSON != nil {
+		if innerMap := unwrapNestedJSONObject(rawJSON); innerMap != nil {
+			evs, est, msg := extractFromObjectMap(innerMap)
+			if est != "" && estimated == "" {
+				estimated = est
+			}
+			if msg != "" && message == "" {
+				message = msg
+			}
+			if len(evs) > 0 {
+				return evs, estimated, message
+			}
+		}
+	}
+
+	// 2. Containers aninhados comuns ("payload", "data", "result", "objeto").
+	for _, containerKey := range []string{"payload", "data", "result", "objeto", "track", "rastreio"} {
+		if sub, exists := m[containerKey]; exists && sub != nil {
+			if subMap := unwrapNestedJSONObject(sub); subMap != nil {
+				evs, est, msg := extractFromObjectMap(subMap)
+				if est != "" && estimated == "" {
+					estimated = est
+				}
+				if msg != "" && message == "" {
+					message = msg
+				}
+				if len(evs) > 0 {
+					return evs, estimated, message
+				}
+			}
+		}
+	}
+
+	// 3. Array "objetos" (padrão Correios SRO v2: {"objetos": [{"codObjeto": "...", "eventos": [...]}]}).
+	if objsRaw, exists := m["objetos"]; exists {
+		if objsArr, isArr := objsRaw.([]any); isArr {
+			for _, elem := range objsArr {
+				if objMap := unwrapNestedJSONObject(elem); objMap != nil {
+					evs, est, msg := extractFromObjectMap(objMap)
+					if est != "" && estimated == "" {
+						estimated = est
+					}
+					if msg != "" && message == "" {
+						message = msg
+					}
+					if len(evs) > 0 {
+						return evs, estimated, message
+					}
+				}
+			}
+		}
+	}
+
+	// 4. Listas de eventos em chaves conhecidas.
+	for _, listKey := range []string{"eventos", "events", "historico", "detailList", "trackinfo", "scans", "checkpoints", "movimentacoes"} {
+		if listRaw, exists := m[listKey]; exists && listRaw != nil {
+			var arr []any
+			if a, isArr := listRaw.([]any); isArr {
+				arr = a
+			} else if s, isStr := listRaw.(string); isStr && strings.HasPrefix(strings.TrimSpace(s), "[") {
+				_ = json.Unmarshal([]byte(s), &arr)
+			}
+			if len(arr) > 0 {
+				parsedList := make([]siteRastreioEvent, 0, len(arr))
+				for _, item := range arr {
+					if evMap := unwrapNestedJSONObject(item); evMap != nil {
+						if ev, ok := parseFlexibleEventMap(evMap); ok {
+							parsedList = append(parsedList, ev)
+						}
+					}
+				}
+				if len(parsedList) > 0 {
+					return parsedList, estimated, message
+				}
+			}
+		}
+	}
+
+	// 5. Evento único em "eventoMaisRecente" / "latestEvent" / "ultimoEvento".
+	for _, singleKey := range []string{"eventoMaisRecente", "latestEvent", "ultimoEvento", "lastEvent"} {
+		if singleRaw, exists := m[singleKey]; exists && singleRaw != nil {
+			if evMap := unwrapNestedJSONObject(singleRaw); evMap != nil {
+				if ev, ok := parseFlexibleEventMap(evMap); ok {
+					return []siteRastreioEvent{ev}, estimated, message
+				}
+			}
+		}
+	}
+
+	// 6. Fallback para status simples no próprio objeto (ex: payload.status / payload.latestUpdate no Wonca).
+	statusStr := firstNonEmptyStr(anyToString(m["status"]), anyToString(m["situacao"]))
+	detailStr := firstNonEmptyStr(anyToString(m["statusDetail"]), anyToString(m["latestUpdate"]), anyToString(m["descricao"]))
+	if isMeaningfulTopStatus(statusStr, detailStr) {
+		dt := firstNonEmptyStr(
+			extractDateAny(m["mailingDate"]),
+			extractDateAny(m["updatedAt"]),
+			extractDateAny(m["data"]),
+		)
+		desc := statusStr
+		if desc == "" || strings.EqualFold(desc, "found") || strings.EqualFold(desc, "ok") {
+			desc = detailStr
+		}
+		return []siteRastreioEvent{{
+			Descricao: desc,
+			Detalhe:   detailStr,
+			Data:      dt,
+			Status:    statusStr,
+		}}, estimated, message
+	}
+
+	return nil, estimated, message
+}
+
+func unwrapNestedJSONObject(v any) map[string]any {
+	if v == nil {
+		return nil
+	}
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	if s, ok := v.(string); ok {
+		trimmed := strings.TrimSpace(s)
+		if strings.HasPrefix(trimmed, "{") {
+			var m map[string]any
+			if err := json.Unmarshal([]byte(trimmed), &m); err == nil {
+				return m
+			}
+		}
+		if strings.HasPrefix(trimmed, "[") {
+			var arr []any
+			if err := json.Unmarshal([]byte(trimmed), &arr); err == nil && len(arr) > 0 {
+				if m, ok := arr[0].(map[string]any); ok {
+					return m
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func isMeaningfulTopStatus(status, detail string) bool {
+	s := strings.ToLower(strings.TrimSpace(status))
+	d := strings.ToLower(strings.TrimSpace(detail))
+	switch s {
+	case "", "not_found", "notfound", "error", "failed", "false", "0", "404", "invalid", "empty":
+		return false
+	case "found", "ok", "true", "success":
+		return d != ""
+	default:
+		return true
+	}
+}
+
+func parseFlexibleEventMap(m map[string]any) (siteRastreioEvent, bool) {
+	codigo := firstNonEmptyStr(
+		anyToString(m["codigo"]),
+		anyToString(m["code"]),
+		anyToString(m["nodeCode"]),
+	)
+	descricao := firstNonEmptyStr(
+		anyToString(m["descricao"]),
+		anyToString(m["status"]),
+		anyToString(m["desc"]),
+		anyToString(m["standerdDesc"]),
+		anyToString(m["tracking_detail"]),
+		anyToString(m["StatusDescription"]),
+		anyToString(m["title"]),
+	)
+	detalhe := firstNonEmptyStr(
+		anyToString(m["detalhe"]),
+		anyToString(m["statusDetail"]),
+		anyToString(m["Details"]),
+		anyToString(m["comentario"]),
+		anyToString(m["subStatus"]),
+	)
+	status := firstNonEmptyStr(
+		anyToString(m["status"]),
+		descricao,
+	)
+
+	if descricao == "" && detalhe == "" && status == "" {
+		return siteRastreioEvent{}, false
+	}
+
+	dateStr := firstNonEmptyStr(
+		extractDateAny(m["dtHrCriado"]),
+		extractDateAny(m["data"]),
+		extractDateAny(m["date"]),
+		extractDateAny(m["timestamp"]),
+		extractDateAny(m["time"]),
+		extractDateAny(m["checkpoint_date"]),
+		extractDateAny(m["createdAt"]),
+	)
+	timeOnly := strings.TrimSpace(anyToString(m["time"]))
+	if timeOnly != "" && dateStr != "" && !strings.Contains(dateStr, ":") && len(dateStr) == 10 {
+		dateStr = dateStr + "T" + timeOnly
+	}
+	horaOnly := strings.TrimSpace(anyToString(m["hora"]))
+	if horaOnly != "" && dateStr != "" && !strings.Contains(dateStr, ":") {
+		dateStr = dateStr + " " + horaOnly
+	}
+
+	loc, unitPt := extractUnitFromAny(m["unidade"])
+	if loc == "" || loc == "Brasil" {
+		directLoc := firstNonEmptyStr(
+			anyToString(m["local"]),
+			anyToString(m["location"]),
+			anyToString(m["Location"]),
+		)
+		city := firstNonEmptyStr(anyToString(m["cidade"]), anyToString(m["city"]))
+		state := firstNonEmptyStr(anyToString(m["uf"]), anyToString(m["state"]))
+		zip := firstNonEmptyStr(anyToString(m["cep"]), anyToString(m["zip"]))
+
+		if directLoc != "" {
+			loc = directLoc
+		} else if city != "" {
+			if state != "" {
+				loc = city + " - " + state
+			} else {
+				loc = city
+			}
+		}
+		if unitPt == nil && (city != "" || state != "" || loc != "") {
+			unitPt = &domain.GeoPoint{
+				City:         city,
+				State:        state,
+				ZipCode:      zip,
+				FacilityType: "HUB",
+				FacilityName: loc,
+			}
+		}
+	}
+
 	var dest string
 	var destPt *domain.GeoPoint
-	if ev.UnidadeDestino != nil {
-		d, dPt := extractCorreiosUnitLocation(*ev.UnidadeDestino)
-		if d != "" && d != "Brasil" {
-			dest = d
-			destPt = dPt
-		}
+	if dLoc, dPt := extractUnitFromAny(m["unidadeDestino"]); dLoc != "" && dLoc != "Brasil" {
+		dest = dLoc
+		destPt = dPt
+	} else if dStr := firstNonEmptyStr(anyToString(m["destino"]), anyToString(m["destination"])); dStr != "" {
+		dest = dStr
 	}
-	// Se a unidade atual não trouxe cidade específica mas há unidadeDestino (ex: encaminhado para),
-	// preserva o local de origem e anexa o destino para o GeoEnricher resolver a rota.
+
 	if (loc == "" || loc == "Brasil") && dest != "" {
 		loc = dest
 	}
+
 	return siteRastreioEvent{
-		Codigo:           ev.Codigo,
-		Descricao:        ev.Descricao,
-		Detalhe:          ev.Detalhe,
-		Data:             extractFlexibleDate(ev.DtHrCriado),
+		Codigo:           codigo,
+		Descricao:        descricao,
+		Detalhe:          detalhe,
+		Data:             dateStr,
 		Local:            loc,
 		Destino:          dest,
+		Status:           status,
 		UnitPoint:        unitPt,
 		DestinationPoint: destPt,
+	}, true
+}
+
+func extractUnitFromAny(v any) (string, *domain.GeoPoint) {
+	m := unwrapNestedJSONObject(v)
+	if m == nil {
+		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s), nil
+		}
+		return "", nil
 	}
+
+	var u woncaCorreiosUnit
+	u.Nome = firstNonEmptyStr(anyToString(m["nome"]), anyToString(m["name"]))
+	u.Tipo = firstNonEmptyStr(anyToString(m["tipo"]), anyToString(m["type"]), anyToString(m["tipounidade"]))
+	u.Cidade = firstNonEmptyStr(anyToString(m["cidade"]), anyToString(m["city"]))
+	u.UF = firstNonEmptyStr(anyToString(m["uf"]), anyToString(m["state"]), anyToString(m["codSro"]))
+
+	if endMap := unwrapNestedJSONObject(m["endereco"]); endMap != nil {
+		u.Endereco.Cidade = firstNonEmptyStr(anyToString(endMap["cidade"]), anyToString(endMap["city"]))
+		u.Endereco.UF = firstNonEmptyStr(anyToString(endMap["uf"]), anyToString(endMap["state"]))
+		u.Endereco.Bairro = firstNonEmptyStr(anyToString(endMap["bairro"]), anyToString(endMap["neighborhood"]))
+		u.Endereco.Logradouro = firstNonEmptyStr(anyToString(endMap["logradouro"]), anyToString(endMap["address"]))
+		u.Endereco.CEP = firstNonEmptyStr(anyToString(endMap["cep"]), anyToString(endMap["zip"]))
+	}
+
+	return extractCorreiosUnitLocation(u)
+}
+
+func extractDateAny(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch val := v.(type) {
+	case string:
+		d := strings.TrimSpace(val)
+		if idx := strings.IndexByte(d, '.'); idx > 10 && !strings.HasSuffix(d, "Z") {
+			d = d[:idx]
+		}
+		return d
+	case map[string]any:
+		d := firstNonEmptyStr(anyToString(val["date"]), anyToString(val["data"]), anyToString(val["iso"]))
+		if idx := strings.IndexByte(d, '.'); idx > 10 && !strings.HasSuffix(d, "Z") {
+			d = d[:idx]
+		}
+		return d
+	default:
+		return ""
+	}
+}
+
+func anyToString(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch val := v.(type) {
+	case string:
+		return strings.TrimSpace(val)
+	case float64:
+		return fmt.Sprintf("%.0f", val)
+	case json.Number:
+		return val.String()
+	default:
+		return ""
+	}
+}
+
+func firstNonEmptyStr(candidates ...string) string {
+	for _, c := range candidates {
+		if trimmed := strings.TrimSpace(c); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func summarizeJSONShape(rawBody []byte, extractedMsg string) string {
+	var m map[string]any
+	if err := json.Unmarshal(rawBody, &m); err != nil {
+		return strings.TrimSpace(extractedMsg)
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var innerKeys []string
+	if rawJSON, ok := m["json"]; ok {
+		if inner := unwrapNestedJSONObject(rawJSON); inner != nil {
+			for k := range inner {
+				innerKeys = append(innerKeys, k)
+			}
+			sort.Strings(innerKeys)
+		}
+	} else if payload, ok := m["payload"]; ok {
+		if inner := unwrapNestedJSONObject(payload); inner != nil {
+			for k := range inner {
+				innerKeys = append(innerKeys, k)
+			}
+			sort.Strings(innerKeys)
+		}
+	}
+
+	shape := "keys=" + strings.Join(keys, ",")
+	if len(innerKeys) > 0 {
+		shape += " inner=" + strings.Join(innerKeys, ",")
+	}
+	if extractedMsg != "" {
+		return extractedMsg + " [" + shape + "]"
+	}
+	return shape
 }
 
 func extractCorreiosUnitLocation(u woncaCorreiosUnit) (string, *domain.GeoPoint) {
@@ -519,29 +797,6 @@ func extractCorreiosUnitLocation(u woncaCorreiosUnit) (string, *domain.GeoPoint)
 		}
 	}
 	return loc, pt
-}
-
-func extractFlexibleDate(raw json.RawMessage) string {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" || trimmed == "null" {
-		return ""
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return strings.TrimSpace(s)
-	}
-	var obj struct {
-		Date string `json:"date"`
-	}
-	if err := json.Unmarshal(raw, &obj); err == nil {
-		d := strings.TrimSpace(obj.Date)
-		// Remove microssegundos ".000000" para compatibilidade com parseTimestamp
-		if idx := strings.IndexByte(d, '.'); idx > 0 {
-			d = d[:idx]
-		}
-		return d
-	}
-	return ""
 }
 
 func mapSiteRastreioEvent(ev siteRastreioEvent) domain.TrackingEvent {
@@ -628,36 +883,6 @@ type siteRastreioEvent struct {
 	DestinationPoint *domain.GeoPoint `json:"-"`
 }
 
-type woncaEvent struct {
-	Status       string `json:"status"`
-	StatusDetail string `json:"statusDetail"`
-	Location     string `json:"location"`
-	City         string `json:"city"`
-	State        string `json:"state"`
-	Zip          string `json:"zip"`
-	Date         string `json:"date"`
-	Time         string `json:"time"`
-}
-
-type woncaPayload struct {
-	TrackingNumber string               `json:"trackingNumber"`
-	CodObjeto      string               `json:"codObjeto"`
-	DtPrevista     string               `json:"dtPrevista"`
-	Found          bool                 `json:"found"`
-	Delivered      bool                 `json:"delivered"`
-	Status         string               `json:"status"`
-	StatusDetail   string               `json:"statusDetail"`
-	LatestUpdate   string               `json:"latestUpdate"`
-	MailingDate    string               `json:"mailingDate"`
-	Events         []woncaEvent         `json:"events"`
-	Eventos        []woncaCorreiosEvent `json:"eventos"`
-	Objetos        []struct {
-		CodObjeto  string               `json:"codObjeto"`
-		DtPrevista string               `json:"dtPrevista"`
-		Eventos    []woncaCorreiosEvent `json:"eventos"`
-	} `json:"objetos"`
-}
-
 type woncaCorreiosUnit struct {
 	Nome     string `json:"nome"`
 	Tipo     string `json:"tipo"`
@@ -670,41 +895,4 @@ type woncaCorreiosUnit struct {
 		Logradouro string `json:"logradouro"`
 		CEP        string `json:"cep"`
 	} `json:"endereco"`
-}
-
-type woncaCorreiosEvent struct {
-	Codigo         string             `json:"codigo"`
-	Tipo           string             `json:"tipo"`
-	DtHrCriado     json.RawMessage    `json:"dtHrCriado"`
-	Descricao      string             `json:"descricao"`
-	Detalhe        string             `json:"detalhe"`
-	Unidade        woncaCorreiosUnit  `json:"unidade"`
-	UnidadeDestino *woncaCorreiosUnit `json:"unidadeDestino"`
-}
-
-type woncaCorreiosJSON struct {
-	CodObjeto  string               `json:"codObjeto"`
-	DtPrevista string               `json:"dtPrevista"`
-	Eventos    []woncaCorreiosEvent `json:"eventos"`
-	Objetos    []struct {
-		CodObjeto  string               `json:"codObjeto"`
-		DtPrevista string               `json:"dtPrevista"`
-		Eventos    []woncaCorreiosEvent `json:"eventos"`
-	} `json:"objetos"`
-	Payload *woncaPayload `json:"payload"`
-}
-
-type siteRastreioResponse struct {
-	JSON              json.RawMessage     `json:"json"`
-	Codigo            string              `json:"codigo"`
-	Status            string              `json:"status"`
-	Success           *bool               `json:"success"`
-	Message           string              `json:"message"`
-	Error             string              `json:"error"`
-	PrevisaoEntrega   string              `json:"previsaoEntrega"`
-	DtPrevista        string              `json:"dtPrevista"`
-	EventoMaisRecente *siteRastreioEvent  `json:"eventoMaisRecente"`
-	Historico         []siteRastreioEvent `json:"historico"`
-	Eventos           []siteRastreioEvent `json:"eventos"`
-	Payload           *woncaPayload       `json:"payload"`
 }

@@ -14,11 +14,13 @@ import (
 // ProviderChain orquestra múltiplos provedores em cascata:
 // free_direct -> siterastreio (1.000 grátis/mês) -> 17track -> trackingmore (-> smart_demo_fallback se DEMO_FALLBACK_ENABLED=true).
 type ProviderChain struct {
-	providers []Provider
+	providers       []Provider
+	allowSampleDemo bool
 }
 
 // NewDefaultChain instancia a cadeia padrão lendo as variáveis de ambiente de configuração e créditos.
-// Em produção (DEMO_FALLBACK_ENABLED != "true"), não inclui dados simulados para evitar falsos positivos.
+// Em produção (DEMO_FALLBACK_ENABLED != "true"), não inclui dados simulados para códigos reais,
+// mantendo funcionando apenas os 5 chips explícitos de exemplo da interface.
 func NewDefaultChain() *ProviderChain {
 	list := []Provider{
 		NewFreeDirectProviderFromEnv(),
@@ -29,7 +31,9 @@ func NewDefaultChain() *ProviderChain {
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("DEMO_FALLBACK_ENABLED")), "true") {
 		list = append(list, NewSmartFallbackProvider())
 	}
-	return NewChain(list)
+	c := NewChain(list)
+	c.allowSampleDemo = true
+	return c
 }
 
 // NewChain cria uma cadeia personalizada com os provedores fornecidos na ordem de prioridade.
@@ -79,7 +83,24 @@ func (c *ProviderChain) Track(ctx context.Context, code string, carrierInfo doma
 		}
 	}
 
+	if c.allowSampleDemo && IsExplicitSampleCode(cleanCode) {
+		if res, err := NewSmartFallbackProvider().Track(ctx, cleanCode, carrierInfo); err == nil && res != nil {
+			res.TrackingCode = cleanCode
+			return res, nil
+		}
+	}
+
 	return nil, errors.Join(errs...)
+}
+
+// IsExplicitSampleCode identifica os 5 códigos de exemplo exibidos nos chips da tela inicial.
+func IsExplicitSampleCode(code string) bool {
+	switch carrierpkg.SanitizeCode(code) {
+	case "AA123456789BR", "LGG84920194BR", "AZL577901234BR", "MND994827162BR", "MGL339104857BR":
+		return true
+	default:
+		return false
+	}
 }
 
 // Statuses retorna o estado de saúde, créditos e circuit-breaker de cada provedor da cadeia.
