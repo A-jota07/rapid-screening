@@ -99,6 +99,23 @@ func (c *CatalogEnricher) Enrich(result *domain.TrackingResult) {
 			if ev.Coordinates.FacilityType == "" {
 				ev.Coordinates.FacilityType = defaultFacType
 			}
+			// Auto-cura de entradas antigas em cache cuja cidade está no cityIndex (ex: Rondonópolis/MT, Várzea Grande/MT, Wenceslau Braz/PR)
+			// mas recebeu coordenadas de capital ou de outro estado por homônimo de rua.
+			if ev.Coordinates.City != "" && ev.Coordinates.State != "" {
+				cityQuery := ev.Coordinates.City + " - " + ev.Coordinates.State
+				if c.matchBestCatalogEntry(cityQuery, carrierCode, false) == nil {
+					if cp, ok := c.matchFallbackCity(cityQuery); ok {
+						ev.Coordinates.Lat = cp.Lat
+						ev.Coordinates.Lng = cp.Lng
+						if ev.Coordinates.ZipCode == "74043-010" || ev.Coordinates.ZipCode == "82900-010" {
+							ev.Coordinates.ZipCode = ""
+						}
+						if strings.Contains(ev.Coordinates.Address, "Maurício Fruet") {
+							ev.Coordinates.Address = ""
+						}
+					}
+				}
+			}
 			if ev.Coordinates.City == "" || ev.Coordinates.State == "" || ev.Coordinates.FacilityName == "" {
 				if pt := c.ResolveLocation(ev.Location, ev.Description, carrierCode, ev.Coordinates.FacilityType); pt != nil {
 					if ev.Coordinates.City == "" {
@@ -125,6 +142,15 @@ func (c *CatalogEnricher) Enrich(result *domain.TrackingResult) {
 	chrono := chronologicalEvents(result.Events)
 
 	// 2. Origem: primeiro evento cronológico com coordenadas ou Origin existente.
+	if result.Origin != nil && result.Origin.City != "" && result.Origin.State != "" {
+		cityQuery := result.Origin.City + " - " + result.Origin.State
+		if c.matchBestCatalogEntry(cityQuery, carrierCode, false) == nil {
+			if cp, ok := c.matchFallbackCity(cityQuery); ok {
+				result.Origin.Lat = cp.Lat
+				result.Origin.Lng = cp.Lng
+			}
+		}
+	}
 	if result.Origin != nil && !hasValidCoords(result.Origin) {
 		if pt := c.ResolveLocation(joinNonEmpty(result.Origin.City, result.Origin.State, result.Origin.FacilityName), "", carrierCode, "ORIGIN"); pt != nil {
 			mergeGeoPoint(result.Origin, pt, "ORIGIN")
@@ -142,6 +168,15 @@ func (c *CatalogEnricher) Enrich(result *domain.TrackingResult) {
 	}
 
 	// 3. Localização atual: evento cronológico mais recente com coordenadas.
+	if result.CurrentLocation != nil && result.CurrentLocation.City != "" && result.CurrentLocation.State != "" {
+		cityQuery := result.CurrentLocation.City + " - " + result.CurrentLocation.State
+		if c.matchBestCatalogEntry(cityQuery, carrierCode, false) == nil {
+			if cp, ok := c.matchFallbackCity(cityQuery); ok {
+				result.CurrentLocation.Lat = cp.Lat
+				result.CurrentLocation.Lng = cp.Lng
+			}
+		}
+	}
 	if result.CurrentLocation != nil && !hasValidCoords(result.CurrentLocation) {
 		if pt := c.ResolveLocation(joinNonEmpty(result.CurrentLocation.City, result.CurrentLocation.State, result.CurrentLocation.FacilityName), "", carrierCode, "HUB"); pt != nil {
 			mergeGeoPoint(result.CurrentLocation, pt, pt.FacilityType)
@@ -158,6 +193,15 @@ func (c *CatalogEnricher) Enrich(result *domain.TrackingResult) {
 	}
 
 	// 4. Destino: resolver caso já tenha cidade/estado sem lat/lng ou se já entregue.
+	if result.Destination != nil && result.Destination.City != "" && result.Destination.State != "" {
+		cityQuery := result.Destination.City + " - " + result.Destination.State
+		if c.matchBestCatalogEntry(cityQuery, carrierCode, false) == nil {
+			if cp, ok := c.matchFallbackCity(cityQuery); ok {
+				result.Destination.Lat = cp.Lat
+				result.Destination.Lng = cp.Lng
+			}
+		}
+	}
 	if result.Destination != nil && !hasValidCoords(result.Destination) {
 		locText := joinNonEmpty(result.Destination.Address, result.Destination.City, result.Destination.State, result.Destination.FacilityName)
 		if pt := c.ResolveLocation(locText, "", carrierCode, "DESTINATION"); pt != nil {
@@ -292,6 +336,12 @@ func (c *CatalogEnricher) enrichCDD(result *domain.TrackingResult, chrono []doma
 	carrierName := result.Carrier.Name
 	if carrierName == "" {
 		carrierName = displayCarrierName(carrierCode)
+	}
+
+	// Se o resultado já trouxe um CDD de outro estado diferente da localização atual/destino (ex: cache antigo), recalcular.
+	if result.CDD != nil && result.CurrentLocation != nil && result.CurrentLocation.State != "" && result.CDD.State != "" &&
+		!strings.EqualFold(result.CDD.State, result.CurrentLocation.State) {
+		result.CDD = nil
 	}
 
 	// Se o resultado já trouxe um CDD parcial, enriquecer com os dados completos do catálogo.
@@ -517,7 +567,7 @@ func (c *CatalogEnricher) matchFallbackCity(text string) (cityPoint, bool) {
 			if strings.EqualFold(stateHint, cp.State) {
 				score += 15
 			} else {
-				score -= 25
+				continue
 			}
 		}
 		if score > bestScore {

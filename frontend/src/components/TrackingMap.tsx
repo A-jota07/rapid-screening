@@ -44,6 +44,32 @@ interface TrackingMapProps {
 
 const BRAZIL_DEFAULT_CENTER: [number, number] = [-15.793889, -47.882778];
 
+interface OsrmRouteResponse {
+  code?: string;
+  routes?: Array<{
+    geometry?: {
+      coordinates?: Array<[number, number]>;
+    };
+  }>;
+}
+
+async function fetchOsrmRoadGeometry(
+  points: [number, number][],
+  signal: AbortSignal,
+): Promise<[number, number][] | null> {
+  if (points.length < 2) return null;
+  const coordsParam = points
+    .map(([lat, lng]) => `${lng.toFixed(5)},${lat.toFixed(5)}`)
+    .join(';');
+  const url = `https://router.project-osrm.org/route/v1/driving/${coordsParam}?overview=full&geometries=geojson`;
+  const resp = await fetch(url, { signal });
+  if (!resp.ok) return null;
+  const data = (await resp.json()) as OsrmRouteResponse;
+  const rawCoords = data.routes?.[0]?.geometry?.coordinates;
+  if (!Array.isArray(rawCoords) || rawCoords.length < 2) return null;
+  return rawCoords.map(([lng, lat]) => [lat, lng]);
+}
+
 function createPinIcon(
   fill: string,
   ring: string,
@@ -204,20 +230,37 @@ export function TrackingMap({ result }: TrackingMapProps) {
   }, [result.trackingCode]);
 
   const validRoutePoints = useMemo<GeoPoint[]>(() => {
+    let raw: GeoPoint[] = [];
     if (Array.isArray(result.routePoints) && result.routePoints.length > 0) {
-      return result.routePoints.filter(
+      raw = result.routePoints.filter(
         (p) =>
           typeof p.lat === 'number' &&
           typeof p.lng === 'number' &&
           (p.lat !== 0 || p.lng !== 0),
       );
+    } else {
+      if (result.origin) raw.push(result.origin);
+      if (result.currentLocation) raw.push(result.currentLocation);
+      if (result.destination) raw.push(result.destination);
     }
 
-    const fallback: GeoPoint[] = [];
-    if (result.origin) fallback.push(result.origin);
-    if (result.currentLocation) fallback.push(result.currentLocation);
-    if (result.destination) fallback.push(result.destination);
-    return fallback;
+    // Deduplica pontos na mesma cidade/coordenada para evitar zigue-zague ou pinos sobrepostos
+    const deduped: GeoPoint[] = [];
+    for (const pt of raw) {
+      const prev = deduped[deduped.length - 1];
+      if (
+        prev &&
+        Math.abs(prev.lat - pt.lat) < 0.002 &&
+        Math.abs(prev.lng - pt.lng) < 0.002
+      ) {
+        if (pt.facilityType === 'CDD' || pt.facilityType === 'DESTINATION') {
+          deduped[deduped.length - 1] = pt;
+        }
+        continue;
+      }
+      deduped.push(pt);
+    }
+    return deduped;
   }, [result]);
 
   const routePositions = useMemo<[number, number][]>(
@@ -225,12 +268,55 @@ export function TrackingMap({ result }: TrackingMapProps) {
     [validRoutePoints],
   );
 
+  const [roadRoutePositions, setRoadRoutePositions] = useState<[number, number][] | null>(null);
+  const [gpsRoadPositions, setGpsRoadPositions] = useState<[number, number][] | null>(null);
+
   const cdd = result.cdd;
   const hasCddCoords =
     Boolean(cdd) &&
     typeof cdd?.lat === 'number' &&
     typeof cdd?.lng === 'number' &&
     (cdd.lat !== 0 || cdd.lng !== 0);
+
+  // Busca o traçado rodoviário real (BRs/estradas via OSRM) entre os pontos da encomenda
+  useEffect(() => {
+    setRoadRoutePositions(null);
+    if (routePositions.length < 2) return;
+    const controller = new AbortController();
+    fetchOsrmRoadGeometry(routePositions, controller.signal)
+      .then((geom) => {
+        if (!controller.signal.aborted && geom && geom.length >= 2) {
+          setRoadRoutePositions(geom);
+        }
+      })
+      .catch(() => {
+        // Fallback automático para polilinha direta se OSRM estiver indisponível
+      });
+    return () => controller.abort();
+  }, [routePositions]);
+
+  // Busca o traçado viário real de ruas entre o GPS do usuário e o CDD
+  useEffect(() => {
+    setGpsRoadPositions(null);
+    if (!userLocation || !cdd || !hasCddCoords) return;
+    const controller = new AbortController();
+    fetchOsrmRoadGeometry(
+      [
+        [userLocation.lat, userLocation.lng],
+        [cdd.lat, cdd.lng],
+      ],
+      controller.signal,
+    )
+      .then((geom) => {
+        if (!controller.signal.aborted && geom && geom.length >= 2) {
+          setGpsRoadPositions(geom);
+        }
+      })
+      .catch(() => {
+        // Fallback automático para linha tracejada direta
+      });
+    return () => controller.abort();
+  }, [userLocation, cdd, hasCddCoords]);
 
   // When GPS route is active, focus bounds specifically between User and CDD (plus nearby context)
   const fitBoundsPoints = useMemo<[number, number][]>(() => {
@@ -374,31 +460,33 @@ export function TrackingMap({ result }: TrackingMapProps) {
               className="h-[360px] w-full sm:h-[430px]"
             >
               <TileLayer
-                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
-                url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
+                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
               />
 
               <FitBoundsController points={fitBoundsPoints} focusKey={focusKey} />
 
-              {/* Solid route line: Origin -> Hubs -> CDD -> Destination */}
+              {/* Solid road route line: Origin -> Hubs -> CDD -> Destination */}
               {routePositions.length >= 2 && (
                 <Polyline
-                  positions={routePositions}
+                  positions={roadRoutePositions ?? routePositions}
                   pathOptions={{
                     color: '#2E5A44',
-                    weight: 3.5,
-                    opacity: 0.85,
+                    weight: 4,
+                    opacity: 0.88,
                   }}
                 />
               )}
 
-              {/* Dashed terracotta GPS route from user to CDD */}
+              {/* Dashed terracotta GPS street route from user to CDD */}
               {userLocation && cdd && hasCddCoords && (
                 <Polyline
-                  positions={[
-                    [userLocation.lat, userLocation.lng],
-                    [cdd.lat, cdd.lng],
-                  ]}
+                  positions={
+                    gpsRoadPositions ?? [
+                      [userLocation.lat, userLocation.lng],
+                      [cdd.lat, cdd.lng],
+                    ]
+                  }
                   pathOptions={{
                     color: '#B85D3B',
                     weight: 4,

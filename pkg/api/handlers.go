@@ -227,7 +227,7 @@ func (s *Server) handleTrack(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveCached(w http.ResponseWriter, cached *domain.TrackingResult, cacheStatus string, cooldownSecs int, noStore bool) {
 	cached.Cached = true
 	cached.ProviderUsed = "cache"
-	if s.enricher != nil && len(cached.RoutePoints) == 0 {
+	if s.enricher != nil {
 		s.enricher.Enrich(cached)
 	}
 	w.Header().Set("X-Cache-Status", cacheStatus)
