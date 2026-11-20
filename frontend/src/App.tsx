@@ -267,7 +267,7 @@ export function App() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2">
             <span
               className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold ${
                 backendOnline
@@ -285,6 +285,32 @@ export function App() {
                 {backendOnline ? 'API Conectada' : 'Verificando API'}
               </span>
             </span>
+
+            <a
+              href="https://alexandrejunior.com.br/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex min-h-[34px] items-center justify-center rounded-full bg-[#2E5A44] px-3.5 py-1.5 text-xs font-semibold text-[#FCFBF8] shadow-xs transition-colors hover:bg-[#234735]"
+            >
+              Portfólio
+            </a>
+
+            <a
+              href="https://github.com/A-jota07"
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="Perfil no GitHub"
+              title="GitHub"
+              className="inline-flex h-[34px] w-[34px] items-center justify-center rounded-full border border-[#DCD5C9] bg-[#F6F4EE] text-[#23221F] shadow-xs transition-colors hover:border-[#2E5A44] hover:bg-[#E6EFEA] hover:text-[#234735]"
+            >
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                className="h-4 w-4 fill-current"
+              >
+                <path d="M12 0.5C5.648 0.5 0.5 5.648 0.5 12c0 5.084 3.292 9.395 7.865 10.916.575.106.785-.25.785-.555 0-.274-.01-1-.015-1.962-3.2.695-3.875-1.542-3.875-1.542-.523-1.329-1.277-1.682-1.277-1.682-1.044-.714.079-.7.079-.7 1.154.081 1.762 1.185 1.762 1.185 1.026 1.758 2.692 1.25 3.348.956.104-.743.402-1.25.73-1.538-2.555-.291-5.242-1.277-5.242-5.684 0-1.256.449-2.283 1.185-3.088-.119-.29-.513-1.46.112-3.044 0 0 .966-.309 3.165 1.179A11.02 11.02 0 0 1 12 6.065c.978.004 1.963.132 2.883.388 2.197-1.488 3.162-1.179 3.162-1.179.627 1.584.233 2.754.114 3.044.738.805 1.184 1.832 1.184 3.088 0 4.418-2.691 5.39-5.254 5.675.414.356.782 1.059.782 2.135 0 1.542-.014 2.785-.014 3.164 0 .308.208.667.791.554C20.212 21.391 23.5 17.082 23.5 12 23.5 5.648 18.352.5 12 .5Z" />
+              </svg>
+            </a>
           </div>
         </div>
       </header>
