@@ -3,12 +3,14 @@ services:
     image: postgres:16-alpine
     container_name: rapid-screening-postgres
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-rapid}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rapid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}
       POSTGRES_DB: ${POSTGRES_DB:-rapid_screening}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
@@ -22,28 +24,34 @@ services:
     image: redis:7-alpine
     container_name: rapid-screening-redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    security_opt:
+      - no-new-privileges:true
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?Defina REDIS_PASSWORD no arquivo .env}"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redisdata:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"${REDIS_PASSWORD}\" ping | grep -q PONG"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   backend:
     profiles: ["backend"]
-    image: golang:1.22-alpine
+    image: golang:1.24-alpine
     container_name: rapid-screening-backend
     working_dir: /app
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     command: ["go", "run", "./cmd/server"]
     ports:
-      - "${PORT:-8080}:8080"
+      - "127.0.0.1:${PORT:-8080}:8080"
     volumes:
-      - .:/app
+      - .:/app:ro
       - ./data:/data
     environment:
       PORT: ${PORT:-8080}
@@ -51,11 +59,11 @@ services:
       CACHE_TTL_MINUTES: ${CACHE_TTL_MINUTES:-15}
       REFRESH_COOLDOWN_SECONDS: ${REFRESH_COOLDOWN_SECONDS:-60}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:3000}
-      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?Defina WEBHOOK_SECRET no arquivo .env}
       TRACK17_API_KEY: ${TRACK17_API_KEY:-}
       TRACKINGMORE_API_KEY: ${TRACKINGMORE_API_KEY:-}
-      DATABASE_URL: postgres://${POSTGRES_USER:-rapid}:${POSTGRES_PASSWORD:-rapid}@postgres:5432/${POSTGRES_DB:-rapid_screening}?sslmode=disable
-      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgres://${POSTGRES_USER:-rapid}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rapid_screening}?sslmode=disable
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
     depends_on:
       postgres:
         condition: service_healthy

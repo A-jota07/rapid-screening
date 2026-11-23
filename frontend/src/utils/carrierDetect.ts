@@ -149,7 +149,7 @@ export function sanitizeTrackingInput(raw: string): string {
 
 export function detectCarrierLocally(
   rawCode: string,
-  backendCarriers?: CarrierInfo[],
+  _backendCarriers?: CarrierInfo[],
 ): CarrierInfo | null {
   const code = sanitizeTrackingInput(rawCode);
   if (code.length < 4) {
@@ -166,24 +166,6 @@ export function detectCarrierLocally(
         patternDescription: rule.patternDescription,
         regexPattern: rule.regexPattern,
       };
-    }
-  }
-
-  if (backendCarriers && backendCarriers.length > 0) {
-    for (const carrier of backendCarriers) {
-      if (!carrier.regexPattern) continue;
-      try {
-        const re = new RegExp(carrier.regexPattern, 'i');
-        if (re.test(code)) {
-          return {
-            ...carrier,
-            detectedBy: 'regex',
-            confidence: carrier.confidence || 0.9,
-          };
-        }
-      } catch {
-        // Ignore malformed external pattern
-      }
     }
   }
 

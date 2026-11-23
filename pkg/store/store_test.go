@@ -441,9 +441,10 @@ func TestVercelTempResolutionAndUpstashColdStartHydration(t *testing.T) {
 		t.Fatalf("expected cold-start hydration from Upstash REST, got ok=%v res=%+v", ok, got)
 	}
 
+	// Em ambiente Vercel, Recent() deve permanecer vazio para não vazar códigos entre usuários.
 	recent := st2.Recent(5)
-	if len(recent) != 1 || recent[0].TrackingCode != "VERCEL123BR" {
-		t.Fatalf("expected cold-start recent list from Upstash REST, got %+v", recent)
+	if len(recent) != 0 {
+		t.Fatalf("expected empty recent list on Vercel to prevent cross-user leakage, got %+v", recent)
 	}
 }
 

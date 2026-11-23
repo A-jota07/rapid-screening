@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
@@ -23,6 +22,8 @@ const (
 	defaultSiteRastreioCredits = 1000
 	defaultSiteRastreioTimeout = 10 * time.Second
 	defaultSiteRastreioCircuit = 5 * time.Minute
+	maxJSONParseDepth          = 8
+	maxExtractedEvents         = 100
 )
 
 // SiteRastreioConfig configura o provedor Site Rastreio / Wonca Labs (cota gratuita mensal de 1.000 req/mês).
@@ -70,17 +71,14 @@ func NewSiteRastreioProvider(cfg SiteRastreioConfig) *SiteRastreioProvider {
 	if credits < 0 {
 		credits = defaultSiteRastreioCredits
 	}
-	baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
-	if baseURL == "" {
-		if strings.HasPrefix(apiKey, "sr_live_") {
-			baseURL = defaultSiteRastreioBaseURL
-		} else {
-			baseURL = defaultWoncaBaseURL
-		}
+	defaultBase := defaultWoncaBaseURL
+	if strings.HasPrefix(apiKey, "sr_live_") {
+		defaultBase = defaultSiteRastreioBaseURL
 	}
+	baseURL := sanitizeProviderBaseURL(cfg.BaseURL, defaultBase)
 	client := cfg.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: defaultSiteRastreioTimeout}
+		client = newSafeHTTPClient(defaultSiteRastreioTimeout)
 	}
 	circuitDur := cfg.CircuitDuration
 	if circuitDur <= 0 {
@@ -131,7 +129,7 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 		return res, err
 	}
 
-	rawEvents, estRaw, extractedMsg,explicitFail := parseFlexibleSiteRastreioPayload(rawBody)
+	rawEvents, estRaw, extractedMsg, explicitFail := parseFlexibleSiteRastreioPayload(rawBody)
 
 	// Se for Wonca Labs e a chamada sem "carrier" retornou vazio, tenta novamente informando o enum "carrier" da transportadora.
 	if isWonca && len(rawEvents) == 0 && !explicitFail {
@@ -159,8 +157,7 @@ func (p *SiteRastreioProvider) Track(ctx context.Context, code string, carrierIn
 			return nil, quotaErr
 		}
 		p.state.refundCredit()
-		diag := summarizeJSONShape(rawBody, extractedMsg)
-		notFoundErr := fmt.Errorf("%w: siterastreio no events (%s)", ErrNotFound, diag)
+		notFoundErr := fmt.Errorf("%w: siterastreio no events", ErrNotFound)
 		p.state.recordFailure(time.Since(start), notFoundErr, 0)
 		return nil, notFoundErr
 	}
@@ -330,9 +327,12 @@ func parseFlexibleSiteRastreioPayload(rawBody []byte) (events []siteRastreioEven
 	rootMap, ok := root.(map[string]any)
 	if !ok {
 		if arr, isArr := root.([]any); isArr {
-			for _, item := range arr {
+			for i, item := range arr {
+				if i >= 20 {
+					break
+				}
 				if m, ok := item.(map[string]any); ok {
-					evs, est, msg := extractFromObjectMap(m)
+					evs, est, msg := extractFromObjectMap(m, 0)
 					if len(evs) > 0 {
 						return evs, est, msg, false
 					}
@@ -348,12 +348,12 @@ func parseFlexibleSiteRastreioPayload(rawBody []byte) (events []siteRastreioEven
 		}
 	}
 
-	events, estimated, message = extractFromObjectMap(rootMap)
+	events, estimated, message = extractFromObjectMap(rootMap, 0)
 	return events, estimated, message, explicitFail
 }
 
-func extractFromObjectMap(m map[string]any) (events []siteRastreioEvent, estimated string, message string) {
-	if m == nil {
+func extractFromObjectMap(m map[string]any, depth int) (events []siteRastreioEvent, estimated string, message string) {
+	if m == nil || depth > maxJSONParseDepth {
 		return nil, "", ""
 	}
 
@@ -372,7 +372,7 @@ func extractFromObjectMap(m map[string]any) (events []siteRastreioEvent, estimat
 	// 1. Campo "json" (Wonca Labs costuma retornar string JSON ou objeto JSON dentro de "json").
 	if rawJSON, exists := m["json"]; exists && rawJSON != nil {
 		if innerMap := unwrapNestedJSONObject(rawJSON); innerMap != nil {
-			evs, est, msg := extractFromObjectMap(innerMap)
+			evs, est, msg := extractFromObjectMap(innerMap, depth+1)
 			if est != "" && estimated == "" {
 				estimated = est
 			}
@@ -389,7 +389,7 @@ func extractFromObjectMap(m map[string]any) (events []siteRastreioEvent, estimat
 	for _, containerKey := range []string{"payload", "data", "result", "objeto", "track", "rastreio"} {
 		if sub, exists := m[containerKey]; exists && sub != nil {
 			if subMap := unwrapNestedJSONObject(sub); subMap != nil {
-				evs, est, msg := extractFromObjectMap(subMap)
+				evs, est, msg := extractFromObjectMap(subMap, depth+1)
 				if est != "" && estimated == "" {
 					estimated = est
 				}
@@ -406,9 +406,12 @@ func extractFromObjectMap(m map[string]any) (events []siteRastreioEvent, estimat
 	// 3. Array "objetos" (padrão Correios SRO v2: {"objetos": [{"codObjeto": "...", "eventos": [...]}]}).
 	if objsRaw, exists := m["objetos"]; exists {
 		if objsArr, isArr := objsRaw.([]any); isArr {
-			for _, elem := range objsArr {
+			for i, elem := range objsArr {
+				if i >= 10 {
+					break
+				}
 				if objMap := unwrapNestedJSONObject(elem); objMap != nil {
-					evs, est, msg := extractFromObjectMap(objMap)
+					evs, est, msg := extractFromObjectMap(objMap, depth+1)
 					if est != "" && estimated == "" {
 						estimated = est
 					}
@@ -433,8 +436,12 @@ func extractFromObjectMap(m map[string]any) (events []siteRastreioEvent, estimat
 				_ = json.Unmarshal([]byte(s), &arr)
 			}
 			if len(arr) > 0 {
-				parsedList := make([]siteRastreioEvent, 0, len(arr))
-				for _, item := range arr {
+				limit := len(arr)
+				if limit > maxExtractedEvents {
+					limit = maxExtractedEvents
+				}
+				parsedList := make([]siteRastreioEvent, 0, limit)
+				for _, item := range arr[:limit] {
 					if evMap := unwrapNestedJSONObject(item); evMap != nil {
 						if ev, ok := parseFlexibleEventMap(evMap); ok {
 							parsedList = append(parsedList, ev)
@@ -700,44 +707,6 @@ func firstNonEmptyStr(candidates ...string) string {
 		}
 	}
 	return ""
-}
-
-func summarizeJSONShape(rawBody []byte, extractedMsg string) string {
-	var m map[string]any
-	if err := json.Unmarshal(rawBody, &m); err != nil {
-		return strings.TrimSpace(extractedMsg)
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var innerKeys []string
-	if rawJSON, ok := m["json"]; ok {
-		if inner := unwrapNestedJSONObject(rawJSON); inner != nil {
-			for k := range inner {
-				innerKeys = append(innerKeys, k)
-			}
-			sort.Strings(innerKeys)
-		}
-	} else if payload, ok := m["payload"]; ok {
-		if inner := unwrapNestedJSONObject(payload); inner != nil {
-			for k := range inner {
-				innerKeys = append(innerKeys, k)
-			}
-			sort.Strings(innerKeys)
-		}
-	}
-
-	shape := "keys=" + strings.Join(keys, ",")
-	if len(innerKeys) > 0 {
-		shape += " inner=" + strings.Join(innerKeys, ",")
-	}
-	if extractedMsg != "" {
-		return extractedMsg + " [" + shape + "]"
-	}
-	return shape
 }
 
 func extractCorreiosUnitLocation(u woncaCorreiosUnit) (string, *domain.GeoPoint) {

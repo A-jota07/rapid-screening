@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,17 +20,18 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		h.Set("X-XSS-Protection", "1; mode=block")
+		h.Set("X-XSS-Protection", "0")
 		h.Set("Permissions-Policy", "geolocation=(self), microphone=(), camera=()")
 		h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
+		h.Set("Cross-Origin-Resource-Policy", "same-origin")
 		next.ServeHTTP(w, r)
 	})
 }
 
-// CORSMiddleware habilita CORS configurável e responde requisições preflight OPTIONS imediatamente.
+// CORSMiddleware habilita CORS configurável (fail-closed quando vazio) e responde preflight OPTIONS.
 func CORSMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
-	allowAll := len(allowedOrigins) == 0
+	allowAll := false
 	allowedMap := make(map[string]bool, len(allowedOrigins))
 	for _, o := range allowedOrigins {
 		trimmed := strings.TrimSpace(o)
@@ -55,7 +57,7 @@ func CORSMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
 			}
 
 			h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Webhook-Secret, sign, X-TrackingMore-Signature")
+			h.Set("Access-Control-Allow-Headers", "Content-Type, Accept")
 			h.Set("Access-Control-Expose-Headers", "X-Cache-Status, X-Cache-Cooldown-Remaining, Retry-After")
 			h.Set("Access-Control-Max-Age", "86400")
 
@@ -157,13 +159,16 @@ type ipBucket struct {
 	lastSeen   time.Time
 }
 
-// RateLimiter implementa controle de taxa por IP via Token Bucket com limpeza automática.
+// RateLimiter implementa controle de taxa por IP via Token Bucket com limpeza automática
+// e integração opcional com verificador distribuído (Upstash Redis).
 type RateLimiter struct {
-	mu           sync.Mutex
-	ratePerSec   float64
-	burst        float64
-	buckets      map[string]*ipBucket
-	checkCounter uint64
+	mu               sync.Mutex
+	rpm              int
+	ratePerSec       float64
+	burst            float64
+	buckets          map[string]*ipBucket
+	checkCounter     uint64
+	distributedCheck func(ip string, rpm int) (allowed bool, checked bool)
 }
 
 // NewRateLimiter cria um limitador por IP para rpm (requisições/minuto) e capacidade de rajada (burst).
@@ -173,10 +178,21 @@ func NewRateLimiter(rpm int, burst int) *RateLimiter {
 		return &RateLimiter{}
 	}
 	return &RateLimiter{
+		rpm:        rpm,
 		ratePerSec: float64(rpm) / 60.0,
 		burst:      float64(burst),
 		buckets:    make(map[string]*ipBucket),
 	}
+}
+
+// SetDistributedCheck registra uma função de verificação distribuída (ex: Upstash Redis) para serverless.
+func (rl *RateLimiter) SetDistributedCheck(fn func(ip string, rpm int) (bool, bool)) {
+	if rl == nil {
+		return
+	}
+	rl.mu.Lock()
+	rl.distributedCheck = fn
+	rl.mu.Unlock()
 }
 
 // Allow verifica se o IP possui tokens disponíveis e devolve o tempo de espera em caso negativo.
@@ -249,6 +265,17 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 
 		ip := clientIP(r)
 		allowed, retryAfter := rl.Allow(ip)
+		if allowed && rl.rpm > 0 {
+			rl.mu.Lock()
+			distFn := rl.distributedCheck
+			rl.mu.Unlock()
+			if distFn != nil {
+				if distAllowed, checked := distFn(ip, rl.rpm); checked && !distAllowed {
+					allowed = false
+					retryAfter = 15 * time.Second
+				}
+			}
+		}
 		if !allowed {
 			secs := int(math.Ceil(retryAfter.Seconds()))
 			if secs < 1 {
@@ -267,19 +294,44 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-func clientIP(r *http.Request) string {
-	// Prioriza X-Real-IP injetado pela borda da Vercel antes de X-Forwarded-For
-	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
-		return xrip
+func trustProxyHeaders() bool {
+	if strings.TrimSpace(os.Getenv("VERCEL")) != "" || strings.TrimSpace(os.Getenv("VERCEL_ENV")) != "" {
+		return true
 	}
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		parts := strings.Split(xff, ",")
-		if len(parts) > 0 && strings.TrimSpace(parts[0]) != "" {
-			return strings.TrimSpace(parts[0])
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("TRUST_PROXY_HEADERS")), "true")
+}
+
+func parseValidIP(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || len(trimmed) > 64 {
+		return ""
+	}
+	if ip := net.ParseIP(trimmed); ip != nil {
+		return ip.String()
+	}
+	return ""
+}
+
+func clientIP(r *http.Request) string {
+	if trustProxyHeaders() {
+		// Prioriza X-Real-IP injetado pela borda da Vercel antes de X-Forwarded-For, validando formato IP.
+		if ip := parseValidIP(r.Header.Get("X-Real-IP")); ip != "" {
+			return ip
+		}
+		if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+			parts := strings.Split(xff, ",")
+			if len(parts) > 0 {
+				if ip := parseValidIP(parts[0]); ip != "" {
+					return ip
+				}
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err == nil && host != "" {
+		if ip := parseValidIP(host); ip != "" {
+			return ip
+		}
 		return host
 	}
 	if r.RemoteAddr == "" {

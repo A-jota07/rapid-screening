@@ -31,10 +31,13 @@ func main() {
 	dataFile := resolveDataFile(os.Getenv("DATA_FILE"))
 	cacheTTL := time.Duration(getEnvInt("CACHE_TTL_MINUTES", 15)) * time.Minute
 	refreshCooldown := time.Duration(getEnvInt("REFRESH_COOLDOWN_SECONDS", 60)) * time.Second
-	corsOrigins := splitCSV(getEnvString("CORS_ALLOWED_ORIGINS", "*"))
+	corsOrigins := splitCSV(getEnvString("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000"))
 	rateLimitRPM := getEnvInt("RATE_LIMIT_RPM", 120)
 	rateLimitBurst := getEnvInt("RATE_LIMIT_BURST", 30)
 	webhookSecret := strings.TrimSpace(os.Getenv("WEBHOOK_SECRET"))
+	track17Secret := strings.TrimSpace(os.Getenv("TRACK17_WEBHOOK_SECRET"))
+	tmSecret := strings.TrimSpace(os.Getenv("TRACKINGMORE_WEBHOOK_SECRET"))
+	adminToken := strings.TrimSpace(os.Getenv("ADMIN_TOKEN"))
 
 	trackingStore, err := store.NewTrackingStore(dataFile, cacheTTL, refreshCooldown)
 	if err != nil {
@@ -46,11 +49,14 @@ func main() {
 	chain := providers.NewDefaultChain()
 
 	srv := api.NewServer(trackingStore, enricher, chain, api.ServerConfig{
-		AllowedOrigins: corsOrigins,
-		RateLimitRPM:   rateLimitRPM,
-		RateLimitBurst: rateLimitBurst,
-		WebhookSecret:  webhookSecret,
-		Logger:         logger,
+		AllowedOrigins:            corsOrigins,
+		RateLimitRPM:              rateLimitRPM,
+		RateLimitBurst:            rateLimitBurst,
+		WebhookSecret:             webhookSecret,
+		Track17WebhookSecret:      track17Secret,
+		TrackingMoreWebhookSecret: tmSecret,
+		AdminToken:                adminToken,
+		Logger:                    logger,
 	})
 
 	httpServer := &http.Server{

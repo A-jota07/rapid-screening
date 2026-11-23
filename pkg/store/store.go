@@ -25,6 +25,8 @@ const (
 	DefaultCacheTTL = 15 * time.Minute
 	// DefaultRefreshCooldown é a janela mínima anti-desperdício entre chamadas upstream para o mesmo código.
 	DefaultRefreshCooldown = 60 * time.Second
+	// maxStoreEntries limita o total de itens mantidos em memória/disco para evitar OOM e esgotamento de /tmp.
+	maxStoreEntries = 1000
 )
 
 type cacheEntry struct {
@@ -238,11 +240,12 @@ func (s *TrackingStore) Save(result *domain.TrackingResult) error {
 	s.mu.Lock()
 	s.items[norm] = entry
 	s.lastFetch[norm] = now
+	s.evictLocked(now)
 	err := s.persistLocked()
 	var recentSnapshot []domain.RecentTrackingSummary
 	var entrySnapshot *cacheEntry
 	if s.upstash != nil {
-		if !strings.EqualFold(strings.TrimSpace(os.Getenv("VERCEL_ENV")), "production") {
+		if !isVercelEnv() {
 			recentSnapshot = s.buildRecentLocked(upstashRecentMaxSize)
 		}
 		entrySnapshot = &cacheEntry{
@@ -332,12 +335,13 @@ func (s *TrackingStore) UpsertFromWebhook(code string, carrierHint domain.Carrie
 	}
 	s.items[norm] = storedEntry
 	s.lastFetch[norm] = now
+	s.evictLocked(now)
 
 	err := s.persistLocked()
 	var recentSnapshot []domain.RecentTrackingSummary
 	var entrySnapshot *cacheEntry
 	if err == nil && s.upstash != nil {
-		if !strings.EqualFold(strings.TrimSpace(os.Getenv("VERCEL_ENV")), "production") {
+		if !isVercelEnv() {
 			recentSnapshot = s.buildRecentLocked(upstashRecentMaxSize)
 		}
 		entrySnapshot = &cacheEntry{
@@ -357,9 +361,9 @@ func (s *TrackingStore) UpsertFromWebhook(code string, carrierHint domain.Carrie
 }
 
 // Recent retorna os rastreamentos mais recentemente atualizados ordenados do mais novo para o mais antigo.
-// Em produção (VERCEL_ENV=production), retorna lista vazia para evitar exposição pública de códigos de rastreio de terceiros (IDOR/PII).
+// Em ambiente Vercel (produção ou preview), retorna lista vazia para evitar exposição pública de códigos de terceiros (IDOR/PII).
 func (s *TrackingStore) Recent(limit int) []domain.RecentTrackingSummary {
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("VERCEL_ENV")), "production") {
+	if isVercelEnv() {
 		return []domain.RecentTrackingSummary{}
 	}
 	if limit <= 0 {
@@ -451,6 +455,62 @@ func (s *TrackingStore) ttlForStatus(status domain.StandardStatus) time.Duration
 	}
 }
 
+// CheckDistributedRateLimit consulta o Upstash Redis (quando configurado) para rate limit por IP entre instâncias serverless.
+func (s *TrackingStore) CheckDistributedRateLimit(ip string, rpm int) (bool, bool) {
+	if s == nil || s.upstash == nil || rpm <= 0 {
+		return true, false
+	}
+	return s.upstash.checkRateLimit(ip, rpm, 60)
+}
+
+func (s *TrackingStore) evictLocked(now time.Time) {
+	// 1. Limpar entradas antigas do mapa lastFetch.
+	cooldownCutoff := s.refreshCooldown
+	if cooldownCutoff < 10*time.Minute {
+		cooldownCutoff = 10 * time.Minute
+	}
+	for k, ts := range s.lastFetch {
+		if now.Sub(ts) > cooldownCutoff {
+			delete(s.lastFetch, k)
+		}
+	}
+
+	// 2. Remover itens expirados há mais de 2 horas (fora da janela de stale fallback).
+	for k, entry := range s.items {
+		if entry == nil || entry.Result == nil {
+			delete(s.items, k)
+			continue
+		}
+		if !entry.Result.CacheExpiresAt.IsZero() && now.After(entry.Result.CacheExpiresAt.Add(2*time.Hour)) {
+			delete(s.items, k)
+		}
+	}
+
+	// 3. Limitar capacidade máxima para evitar OOM ou esgotamento de /tmp.
+	if len(s.items) <= maxStoreEntries {
+		return
+	}
+	type agedKey struct {
+		key string
+		ts  time.Time
+	}
+	all := make([]agedKey, 0, len(s.items))
+	for k, entry := range s.items {
+		ts := entry.LastFetchAt
+		if ts.IsZero() && entry.Result != nil {
+			ts = entry.Result.LastUpdatedAt
+		}
+		all = append(all, agedKey{key: k, ts: ts})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].ts.Before(all[j].ts)
+	})
+	excess := len(s.items) - maxStoreEntries
+	for i := 0; i < excess && i < len(all); i++ {
+		delete(s.items, all[i].key)
+	}
+}
+
 func (s *TrackingStore) loadFromDisk() error {
 	data, err := os.ReadFile(s.filePath)
 	if err != nil {
@@ -465,6 +525,10 @@ func (s *TrackingStore) loadFromDisk() error {
 
 	var state persistedState
 	if err := json.Unmarshal(data, &state); err != nil {
+		// Em ambiente Vercel serverless (/tmp efêmero), recupera de arquivo corrompido sem travar cold start.
+		if isVercelEnv() {
+			return nil
+		}
 		return fmt.Errorf("decode store file %s: %w", s.filePath, err)
 	}
 
@@ -513,7 +577,7 @@ func (s *TrackingStore) persistLocked() error {
 		Trackings: s.items,
 	}
 
-	payload, err := json.MarshalIndent(state, "", "  ")
+	payload, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("marshal store state: %w", err)
 	}

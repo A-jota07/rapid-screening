@@ -17,7 +17,10 @@ import (
 	"rapid-screening/pkg/domain"
 )
 
-const maxWebhookBodyBytes = 2 << 20 // 2 MiB
+const (
+	maxWebhookBodyBytes = 2 << 20 // 2 MiB
+	maxWebhookEvents    = 100
+)
 
 // Estruturas flexíveis para suportar 17TRACK v2.2 real e payloads simplificados de teste.
 type track17WebhookPayload struct {
@@ -72,13 +75,13 @@ type track17Event struct {
 
 // Estruturas flexíveis para suportar TrackingMore v4 real e payloads simplificados de teste.
 type trackingMoreWebhookPayload struct {
-	Code         int                  `json:"code"`
-	Message      string               `json:"message"`
-	TrackingCode string               `json:"trackingCode"`
-	Number       string               `json:"tracking_number"`
-	CourierCode  string               `json:"courier_code"`
-	Events       []trackingMoreEvent  `json:"events"`
-	Data         json.RawMessage      `json:"data"`
+	Code         int                 `json:"code"`
+	Message      string              `json:"message"`
+	TrackingCode string              `json:"trackingCode"`
+	Number       string              `json:"tracking_number"`
+	CourierCode  string              `json:"courier_code"`
+	Events       []trackingMoreEvent `json:"events"`
+	Data         json.RawMessage     `json:"data"`
 }
 
 type trackingMoreData struct {
@@ -98,25 +101,25 @@ type trackingMoreData struct {
 }
 
 type trackingMoreEvent struct {
-	CheckpointDate             string `json:"checkpoint_date"`
-	Date                       string `json:"Date"`
-	Time                       string `json:"time"`
-	Timestamp                  string `json:"timestamp"`
-	TrackingDetail             string `json:"tracking_detail"`
-	StatusDescription          string `json:"StatusDescription"`
-	Description                string `json:"description"`
-	Details                    string `json:"Details"`
-	Location                   string `json:"location"`
-	LocationCap                string `json:"Location"`
-	CheckpointDeliveryStatus   string `json:"checkpoint_delivery_status"`
-	CheckpointDeliverySub      string `json:"checkpoint_delivery_substatus"`
-	Substatus                  string `json:"substatus"`
-	Status                     string `json:"status"`
-	RawStatus                  string `json:"rawStatus"`
+	CheckpointDate           string `json:"checkpoint_date"`
+	Date                     string `json:"Date"`
+	Time                     string `json:"time"`
+	Timestamp                string `json:"timestamp"`
+	TrackingDetail           string `json:"tracking_detail"`
+	StatusDescription        string `json:"StatusDescription"`
+	Description              string `json:"description"`
+	Details                  string `json:"Details"`
+	Location                 string `json:"location"`
+	LocationCap              string `json:"Location"`
+	CheckpointDeliveryStatus string `json:"checkpoint_delivery_status"`
+	CheckpointDeliverySub    string `json:"checkpoint_delivery_substatus"`
+	Substatus                string `json:"substatus"`
+	Status                   string `json:"status"`
+	RawStatus                string `json:"rawStatus"`
 }
 
 func (s *Server) handleWebhook17Track(w http.ResponseWriter, r *http.Request) {
-	body, ok := s.readAndVerifyWebhookBody(w, r)
+	body, ok := s.readAndVerifyWebhookBody(w, r, "17track")
 	if !ok {
 		return
 	}
@@ -149,7 +152,7 @@ func (s *Server) handleWebhook17Track(w http.ResponseWriter, r *http.Request) {
 
 	rawCode := firstNonEmpty(data.Number, data.TrackingNumber, data.TrackingCode, payload.Number, payload.TrackingCode)
 	code := carrier.SanitizeCode(rawCode)
-	if len(code) < 5 {
+	if len(code) < 5 || len(code) > 40 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error":   "missing_tracking_code",
 			"message": "Número de rastreio ausente ou inválido no webhook 17TRACK.",
@@ -194,6 +197,9 @@ func (s *Server) handleWebhook17Track(w http.ResponseWriter, r *http.Request) {
 	}
 
 	carrierHint := resolveWebhookCarrier(code, carrierID, data.CarrierCode, providerName)
+	if len(rawEvents) > maxWebhookEvents {
+		rawEvents = rawEvents[:maxWebhookEvents]
+	}
 	domainEvents := make([]domain.TrackingEvent, 0, len(rawEvents))
 	for _, ev := range rawEvents {
 		ts := parseFlexibleTime(ev.TimeISO, ev.TimeUTC, ev.Time, ev.Timestamp, ev.Date)
@@ -213,7 +219,7 @@ func (s *Server) handleWebhook17Track(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWebhookTrackingMore(w http.ResponseWriter, r *http.Request) {
-	body, ok := s.readAndVerifyWebhookBody(w, r)
+	body, ok := s.readAndVerifyWebhookBody(w, r, "trackingmore")
 	if !ok {
 		return
 	}
@@ -246,7 +252,7 @@ func (s *Server) handleWebhookTrackingMore(w http.ResponseWriter, r *http.Reques
 
 	rawCode := firstNonEmpty(data.TrackingNumber, data.TrackingCode, data.Number, payload.Number, payload.TrackingCode)
 	code := carrier.SanitizeCode(rawCode)
-	if len(code) < 5 {
+	if len(code) < 5 || len(code) > 40 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error":   "missing_tracking_code",
 			"message": "Número de rastreio ausente ou inválido no webhook TrackingMore.",
@@ -280,6 +286,9 @@ func (s *Server) handleWebhookTrackingMore(w http.ResponseWriter, r *http.Reques
 	}
 
 	carrierHint := resolveWebhookCarrier(code, 0, courierCode, "")
+	if len(rawEvents) > maxWebhookEvents {
+		rawEvents = rawEvents[:maxWebhookEvents]
+	}
 	domainEvents := make([]domain.TrackingEvent, 0, len(rawEvents))
 	for _, ev := range rawEvents {
 		ts := parseFlexibleTime(ev.CheckpointDate, ev.Date, ev.Time, ev.Timestamp)
@@ -326,7 +335,21 @@ func (s *Server) finalizeWebhook(w http.ResponseWriter, code string, carrierHint
 	})
 }
 
-func (s *Server) readAndVerifyWebhookBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+func (s *Server) secretForWebhookProvider(provider string) string {
+	switch provider {
+	case "17track":
+		if s.track17WebhookSecret != "" {
+			return s.track17WebhookSecret
+		}
+	case "trackingmore":
+		if s.trackingMoreWebhookSecret != "" {
+			return s.trackingMoreWebhookSecret
+		}
+	}
+	return s.webhookSecret
+}
+
+func (s *Server) readAndVerifyWebhookBody(w http.ResponseWriter, r *http.Request, provider string) ([]byte, bool) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxWebhookBodyBytes))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -336,18 +359,20 @@ func (s *Server) readAndVerifyWebhookBody(w http.ResponseWriter, r *http.Request
 		return nil, false
 	}
 
-	if s.webhookSecret == "" && isProductionEnv() {
+	secret := s.secretForWebhookProvider(provider)
+	allowInsecure := !isProductionEnv() && strings.EqualFold(strings.TrimSpace(os.Getenv("ALLOW_INSECURE_WEBHOOKS")), "true")
+	if secret == "" && !allowInsecure {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{
 			"error":   "webhook_secret_not_configured",
-			"message": "Recebimento de webhooks desabilitado em produção sem WEBHOOK_SECRET configurado.",
+			"message": "Recebimento de webhooks desabilitado sem WEBHOOK_SECRET configurado.",
 		})
 		return nil, false
 	}
 
-	if s.webhookSecret != "" && !verifyWebhookAuth(r, body, s.webhookSecret) {
+	if secret != "" && !verifyWebhookAuth(r, body, secret, provider) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{
 			"error":   "unauthorized_webhook",
-			"message": "X-Webhook-Secret ou assinatura criptográfica inválida.",
+			"message": "Assinatura criptográfica de webhook ausente ou inválida.",
 		})
 		return nil, false
 	}
@@ -358,35 +383,41 @@ func isProductionEnv() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("VERCEL_ENV")), "production")
 }
 
-func verifyWebhookAuth(r *http.Request, body []byte, secret string) bool {
+func verifyWebhookAuth(r *http.Request, body []byte, secret string, provider string) bool {
 	if secret == "" {
-		return true
+		return false
 	}
 
-	// 1. Validação direta por header X-Webhook-Secret.
-	if hdr := strings.TrimSpace(r.Header.Get("X-Webhook-Secret")); hdr != "" {
-		if subtle.ConstantTimeCompare([]byte(hdr), []byte(secret)) == 1 {
-			return true
+	// 1. Header direto X-Webhook-Secret permitido apenas fora de produção (desenvolvimento/testes).
+	if !isProductionEnv() {
+		if hdr := strings.TrimSpace(r.Header.Get("X-Webhook-Secret")); hdr != "" {
+			if subtle.ConstantTimeCompare([]byte(hdr), []byte(secret)) == 1 {
+				return true
+			}
 		}
 	}
 
 	// 2. Assinatura 17TRACK v2.2 ("sign": SHA256(body + "/" + secret) em hex) ou HMAC-SHA256.
-	if sign := strings.TrimSpace(r.Header.Get("sign")); sign != "" {
-		sum := sha256.Sum256(append(append([]byte{}, body...), append([]byte("/"), secret...)...))
-		expected17 := hex.EncodeToString(sum[:])
-		if subtle.ConstantTimeCompare([]byte(strings.ToLower(sign)), []byte(expected17)) == 1 {
-			return true
-		}
-		if verifyHMACSHA256(body, secret, sign) {
-			return true
+	if provider == "17track" || provider == "" {
+		if sign := strings.TrimSpace(r.Header.Get("sign")); sign != "" {
+			sum := sha256.Sum256(append(append([]byte{}, body...), append([]byte("/"), secret...)...))
+			expected17 := hex.EncodeToString(sum[:])
+			if subtle.ConstantTimeCompare([]byte(strings.ToLower(sign)), []byte(expected17)) == 1 {
+				return true
+			}
+			if verifyHMACSHA256(body, secret, sign) {
+				return true
+			}
 		}
 	}
 
 	// 3. Assinatura HMAC-SHA256 (TrackingMore ou integradores padrão).
-	for _, headerName := range []string{"X-TrackingMore-Signature", "X-Signature", "signature"} {
-		if sig := strings.TrimSpace(r.Header.Get(headerName)); sig != "" {
-			if verifyHMACSHA256(body, secret, sig) {
-				return true
+	if provider == "trackingmore" || provider == "" {
+		for _, headerName := range []string{"X-TrackingMore-Signature", "X-Signature", "signature"} {
+			if sig := strings.TrimSpace(r.Header.Get(headerName)); sig != "" {
+				if verifyHMACSHA256(body, secret, sig) {
+					return true
+				}
 			}
 		}
 	}

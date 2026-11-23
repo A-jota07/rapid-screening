@@ -60,13 +60,10 @@ func NewTrack17Provider(cfg Track17Config) *Track17Provider {
 	if credits < 0 {
 		credits = defaultTrack17Credits
 	}
-	baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
-	if baseURL == "" {
-		baseURL = defaultTrack17BaseURL
-	}
+	baseURL := sanitizeProviderBaseURL(cfg.BaseURL, defaultTrack17BaseURL)
 	client := cfg.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: defaultTrack17Timeout}
+		client = newSafeHTTPClient(defaultTrack17Timeout)
 	}
 	circuitDur := cfg.CircuitDuration
 	if circuitDur <= 0 {

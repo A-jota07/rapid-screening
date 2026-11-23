@@ -158,17 +158,17 @@ var detectionRules = []carrierRule{
 	{info: supportedCarriers[5], strictRegex: reJadlogNum14},
 }
 
-// SanitizeCode remove espaços (qualquer whitespace), hífens e converte o código para maiúsculas.
+// SanitizeCode remove quaisquer caracteres não alfanuméricos ASCII (espaços, hífens, símbolos)
+// e converte o código para maiúsculas, alinhado com a normalização do store.
 func SanitizeCode(code string) string {
 	var b strings.Builder
 	b.Grow(len(code))
-	for _, r := range code {
-		if unicode.IsSpace(r) || r == '-' {
-			continue
+	for _, r := range strings.ToUpper(strings.TrimSpace(code)) {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
 		}
-		b.WriteRune(r)
 	}
-	return strings.ToUpper(b.String())
+	return b.String()
 }
 
 // DetectCarrier identifica a transportadora mais provável para o código informado usando Regex prioritário.

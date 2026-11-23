@@ -28,14 +28,36 @@ import { sanitizeTrackingInput } from './utils/carrierDetect';
 
 const LOCAL_RECENT_STORAGE_KEY = 'rapid_screening_recent_v1';
 
+function isValidRecentItem(item: unknown): item is RecentTrackingSummary {
+  if (!item || typeof item !== 'object') return false;
+  const rec = item as Record<string, unknown>;
+  return (
+    typeof rec.trackingCode === 'string' &&
+    rec.trackingCode.length >= 4 &&
+    rec.trackingCode.length <= 40 &&
+    typeof rec.carrierName === 'string' &&
+    typeof rec.currentStatus === 'string' &&
+    typeof rec.currentStatusLabel === 'string'
+  );
+}
+
 function readLocalRecent(): RecentTrackingSummary[] {
   try {
     const raw = window.localStorage.getItem(LOCAL_RECENT_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(isValidRecentItem).slice(0, 10);
   } catch {
     return [];
+  }
+}
+
+function clearLocalRecent(): void {
+  try {
+    window.localStorage.removeItem(LOCAL_RECENT_STORAGE_KEY);
+  } catch {
+    // Ignore storage errors
   }
 }
 
@@ -234,6 +256,11 @@ export function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
+  const handleClearRecent = () => {
+    clearLocalRecent();
+    setRecentItems([]);
+  };
+
   const handleRefreshNow = () => {
     if (!result || refreshing || cooldownRemaining > 0) return;
     void executeTrack(result.trackingCode, true);
@@ -393,6 +420,7 @@ export function App() {
                   items={recentItems}
                   activeCode={result.trackingCode}
                   onSelectCode={handleSelectCode}
+                  onClearAll={handleClearRecent}
                 />
                 <ProviderStatusPanel
                   result={result}
@@ -464,6 +492,7 @@ export function App() {
               <RecentSearches
                 items={recentItems}
                 onSelectCode={handleSelectCode}
+                onClearAll={handleClearRecent}
               />
             </div>
 

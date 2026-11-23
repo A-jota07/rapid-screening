@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,10 +47,13 @@ func buildHandler() (http.Handler, error) {
 	dataFile := strings.TrimSpace(os.Getenv("DATA_FILE"))
 	cacheTTL := time.Duration(getEnvInt("CACHE_TTL_MINUTES", 15)) * time.Minute
 	refreshCooldown := time.Duration(getEnvInt("REFRESH_COOLDOWN_SECONDS", 60)) * time.Second
-	corsOrigins := splitCSV(getEnvString("CORS_ALLOWED_ORIGINS", "*"))
+	corsOrigins := resolveVercelCORSOrigins()
 	rateLimitRPM := getEnvInt("RATE_LIMIT_RPM", 120)
 	rateLimitBurst := getEnvInt("RATE_LIMIT_BURST", 30)
 	webhookSecret := strings.TrimSpace(os.Getenv("WEBHOOK_SECRET"))
+	track17Secret := strings.TrimSpace(os.Getenv("TRACK17_WEBHOOK_SECRET"))
+	tmSecret := strings.TrimSpace(os.Getenv("TRACKINGMORE_WEBHOOK_SECRET"))
+	adminToken := strings.TrimSpace(os.Getenv("ADMIN_TOKEN"))
 
 	trackingStore, err := store.NewTrackingStore(dataFile, cacheTTL, refreshCooldown)
 	if err != nil {
@@ -60,13 +64,32 @@ func buildHandler() (http.Handler, error) {
 	chain := providers.NewDefaultChain()
 
 	srv := api.NewServer(trackingStore, enricher, chain, api.ServerConfig{
-		AllowedOrigins: corsOrigins,
-		RateLimitRPM:   rateLimitRPM,
-		RateLimitBurst: rateLimitBurst,
-		WebhookSecret:  webhookSecret,
-		Logger:         logger,
+		AllowedOrigins:            corsOrigins,
+		RateLimitRPM:              rateLimitRPM,
+		RateLimitBurst:            rateLimitBurst,
+		WebhookSecret:             webhookSecret,
+		Track17WebhookSecret:      track17Secret,
+		TrackingMoreWebhookSecret: tmSecret,
+		AdminToken:                adminToken,
+		Logger:                    logger,
 	})
 	return srv.Handler(), nil
+}
+
+func resolveVercelCORSOrigins() []string {
+	if configured := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS")); configured != "" {
+		return splitCSV(configured)
+	}
+	origins := []string{"https://rastreio.alexandrejunior.com.br"}
+	for _, envKey := range []string{"VERCEL_PROJECT_PRODUCTION_URL", "VERCEL_URL"} {
+		if host := strings.TrimSpace(os.Getenv(envKey)); host != "" {
+			if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
+				host = "https://" + host
+			}
+			origins = append(origins, strings.TrimRight(host, "/"))
+		}
+	}
+	return origins
 }
 
 func normalizeVercelRequest(r *http.Request) *http.Request {
@@ -77,9 +100,16 @@ func normalizeVercelRequest(r *http.Request) *http.Request {
 		if !strings.HasPrefix(rewrittenPath, "/") {
 			rewrittenPath = "/" + rewrittenPath
 		}
-		req.URL.Path = rewrittenPath
+		cleaned := path.Clean(rewrittenPath)
 		q.Del("__path")
 		req.URL.RawQuery = q.Encode()
+		if strings.HasPrefix(cleaned, "/api/v1/") {
+			req.URL.Path = cleaned
+			req.URL.RawPath = ""
+		} else {
+			req.URL.Path = "/api/v1/__invalid__"
+			req.URL.RawPath = ""
+		}
 		return req
 	}
 

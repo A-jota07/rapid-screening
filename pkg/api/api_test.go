@@ -201,8 +201,11 @@ func TestTrackCacheMissHitAndRefreshCooldown(t *testing.T) {
 	if resp1.Header.Get("X-Cache-Status") != "MISS" {
 		t.Errorf("expected X-Cache-Status=MISS, got %q", resp1.Header.Get("X-Cache-Status"))
 	}
-	if resp1.Header.Get("Cache-Control") != "public, s-maxage=300, stale-while-revalidate=600" {
-		t.Errorf("expected Edge Cache-Control header, got %q", resp1.Header.Get("Cache-Control"))
+	if resp1.Header.Get("Cache-Control") != "private, no-cache" {
+		t.Errorf("expected private Cache-Control header, got %q", resp1.Header.Get("Cache-Control"))
+	}
+	if resp1.Header.Get("Vercel-CDN-Cache-Control") != "s-maxage=300, stale-while-revalidate=600" {
+		t.Errorf("expected Vercel-CDN-Cache-Control header, got %q", resp1.Header.Get("Vercel-CDN-Cache-Control"))
 	}
 
 	var res1 domain.TrackingResult
@@ -279,7 +282,24 @@ func TestTrackCacheMissHitAndRefreshCooldown(t *testing.T) {
 		t.Fatalf("expected 2 upstream calls after cooldown, got %d", tracker.calls.Load())
 	}
 
-	// 5. GET /api/v1/trackings/recent deve listar AA123456789BR
+	// 5. GET /api/v1/trackings/recent deve retornar vazio por padrão (proteção contra exposição pública)
+	respRDefault, err := http.Get(ts.URL + "/api/v1/trackings/recent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer respRDefault.Body.Close()
+	var recentDefault struct {
+		Items []domain.RecentTrackingSummary `json:"items"`
+	}
+	if err := json.NewDecoder(respRDefault.Body).Decode(&recentDefault); err != nil {
+		t.Fatal(err)
+	}
+	if len(recentDefault.Items) != 0 {
+		t.Fatalf("expected empty recent items by default, got %+v", recentDefault.Items)
+	}
+
+	// Com ENABLE_PUBLIC_RECENT=true (opt-in explícito em dev), lista AA123456789BR
+	t.Setenv("ENABLE_PUBLIC_RECENT", "true")
 	respR, err := http.Get(ts.URL + "/api/v1/trackings/recent")
 	if err != nil {
 		t.Fatal(err)

@@ -2,6 +2,8 @@ package verceladapter
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +20,7 @@ func TestVercelServerlessHandler_RewritesCacheAndWebhooks(t *testing.T) {
 	t.Setenv("VERCEL", "1")
 	t.Setenv("FREE_DIRECT_ENABLED", "false")
 	t.Setenv("DEMO_FALLBACK_ENABLED", "true")
+	t.Setenv("WEBHOOK_SECRET", "vercel-test-secret")
 	t.Setenv("TRACK17_API_KEY", "")
 	t.Setenv("TRACKINGMORE_API_KEY", "")
 	t.Setenv("DATA_FILE", filepath.Join(t.TempDir(), "vercel-trackings.json"))
@@ -53,8 +56,11 @@ func TestVercelServerlessHandler_RewritesCacheAndWebhooks(t *testing.T) {
 	if recTrack1.Code != http.StatusOK {
 		t.Fatalf("track 1 failed: status=%d body=%s", recTrack1.Code, recTrack1.Body.String())
 	}
-	if cc := recTrack1.Header().Get("Cache-Control"); !strings.Contains(cc, "s-maxage=300") {
-		t.Errorf("expected Edge Cache-Control with s-maxage=300, got %q", cc)
+	if cc := recTrack1.Header().Get("Vercel-CDN-Cache-Control"); !strings.Contains(cc, "s-maxage=300") {
+		t.Errorf("expected Vercel-CDN-Cache-Control with s-maxage=300, got %q", cc)
+	}
+	if cc := recTrack1.Header().Get("Cache-Control"); cc != "private, no-cache" {
+		t.Errorf("expected private Cache-Control, got %q", cc)
 	}
 
 	var tr1 domain.TrackingResult
@@ -105,8 +111,19 @@ func TestVercelServerlessHandler_RewritesCacheAndWebhooks(t *testing.T) {
 			]
 		}
 	}`)
+	// 5. Webhook reescrito pela Vercel sem assinatura deve retornar 401; com assinatura SHA256 válida deve atualizar.
+	reqWHUnauth := httptest.NewRequest(http.MethodPost, "/api/index.go?__path=/api/v1/webhooks/17track", bytes.NewReader(whBody))
+	reqWHUnauth.Header.Set("Content-Type", "application/json")
+	recWHUnauth := httptest.NewRecorder()
+	Handler(recWHUnauth, reqWHUnauth)
+	if recWHUnauth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unsigned webhook, got %d", recWHUnauth.Code)
+	}
+
+	whSum := sha256.Sum256(append(append([]byte{}, whBody...), []byte("/vercel-test-secret")...))
 	reqWH := httptest.NewRequest(http.MethodPost, "/api/index.go?__path=/api/v1/webhooks/17track", bytes.NewReader(whBody))
 	reqWH.Header.Set("Content-Type", "application/json")
+	reqWH.Header.Set("sign", hex.EncodeToString(whSum[:]))
 	recWH := httptest.NewRecorder()
 	Handler(recWH, reqWH)
 

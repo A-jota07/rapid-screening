@@ -1,4 +1,4 @@
-import { Building2, Clock, History, ArrowUpRight } from 'lucide-react';
+import { Building2, Clock, History, ArrowUpRight, Trash2 } from 'lucide-react';
 import type { RecentTrackingSummary } from '../types/tracking';
 import { formatRelativePtBR } from '../utils/format';
 import { StatusBadge } from './StatusBadge';
@@ -7,12 +7,14 @@ interface RecentSearchesProps {
   items: RecentTrackingSummary[];
   activeCode?: string;
   onSelectCode: (code: string) => void;
+  onClearAll?: () => void;
 }
 
 export function RecentSearches({
   items,
   activeCode,
   onSelectCode,
+  onClearAll,
 }: RecentSearchesProps) {
   return (
     <section
@@ -27,13 +29,26 @@ export function RecentSearches({
               Rastreamentos Recentes
             </h2>
             <p className="text-xs text-[#65625A]">
-              Consultas salvas localmente com reabertura instantânea.
+              Consultas salvas localmente neste navegador.
             </p>
           </div>
         </div>
-        <span className="rounded-full border border-[#DCD5C9] bg-[#F6F4EE] px-2.5 py-0.5 font-mono text-xs font-semibold text-[#65625A]">
-          {items.length}
-        </span>
+        <div className="flex items-center gap-2">
+          {items.length > 0 && onClearAll && (
+            <button
+              type="button"
+              onClick={onClearAll}
+              aria-label="Limpar histórico local de rastreamentos"
+              className="inline-flex items-center gap-1 rounded-lg border border-[#DCD5C9] bg-[#F6F4EE] px-2.5 py-1 text-xs font-medium text-[#65625A] transition-colors hover:bg-[#F7EAE4] hover:text-[#8F4124]"
+            >
+              <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Limpar</span>
+            </button>
+          )}
+          <span className="rounded-full border border-[#DCD5C9] bg-[#F6F4EE] px-2.5 py-0.5 font-mono text-xs font-semibold text-[#65625A]">
+            {items.length}
+          </span>
+        </div>
       </div>
 
       {items.length === 0 ? (

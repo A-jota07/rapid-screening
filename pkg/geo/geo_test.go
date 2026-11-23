@@ -166,13 +166,13 @@ func TestEnrichCarrierSpecificHubsAndAccentInsensitive(t *testing.T) {
 	now := time.Now().UTC()
 
 	cases := []struct {
-		name         string
-		carrier      domain.CarrierInfo
-		location     string
-		status       domain.StandardStatus
-		wantCity     string
-		wantInName   string
-		wantPickup   bool
+		name       string
+		carrier    domain.CarrierInfo
+		location   string
+		status     domain.StandardStatus
+		wantCity   string
+		wantInName string
+		wantPickup bool
 	}{
 		{
 			name:       "Azul Cargo Viracopos Hub",

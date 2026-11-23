@@ -2,12 +2,15 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"log/slog"
 	"math"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"rapid-screening/pkg/carrier"
@@ -24,22 +27,36 @@ type TrackerProvider interface {
 
 // ServerConfig agrupa as opções de inicialização da camada HTTP REST.
 type ServerConfig struct {
-	AllowedOrigins []string
-	RateLimitRPM   int
-	RateLimitBurst int
-	WebhookSecret  string
-	Logger         *slog.Logger
+	AllowedOrigins            []string
+	RateLimitRPM              int
+	RateLimitBurst            int
+	WebhookSecret             string
+	Track17WebhookSecret      string
+	TrackingMoreWebhookSecret string
+	AdminToken                string
+	Logger                    *slog.Logger
+}
+
+type trackFlight struct {
+	done   chan struct{}
+	result *domain.TrackingResult
+	err    error
 }
 
 // Server expõe os endpoints RESTful e webhooks do Rapid Screening.
 type Server struct {
-	store         *store.TrackingStore
-	enricher      domain.GeoEnricher
-	tracker       TrackerProvider
-	webhookSecret string
-	logger        *slog.Logger
-	rateLimiter   *RateLimiter
-	corsOrigins   []string
+	store                     *store.TrackingStore
+	enricher                  domain.GeoEnricher
+	tracker                   TrackerProvider
+	webhookSecret             string
+	track17WebhookSecret      string
+	trackingMoreWebhookSecret string
+	adminToken                string
+	logger                    *slog.Logger
+	rateLimiter               *RateLimiter
+	corsOrigins               []string
+	inFlightMu                sync.Mutex
+	inFlight                  map[string]*trackFlight
 }
 
 // NewServer cria uma nova instância do servidor HTTP com store, geo-enriquecedor e cadeia de provedores.
@@ -48,14 +65,22 @@ func NewServer(st *store.TrackingStore, enricher domain.GeoEnricher, tracker Tra
 	if logger == nil {
 		logger = slog.Default()
 	}
+	rl := NewRateLimiter(cfg.RateLimitRPM, cfg.RateLimitBurst)
+	if st != nil {
+		rl.SetDistributedCheck(st.CheckDistributedRateLimit)
+	}
 	return &Server{
-		store:         st,
-		enricher:      enricher,
-		tracker:       tracker,
-		webhookSecret: strings.TrimSpace(cfg.WebhookSecret),
-		logger:        logger,
-		rateLimiter:   NewRateLimiter(cfg.RateLimitRPM, cfg.RateLimitBurst),
-		corsOrigins:   cfg.AllowedOrigins,
+		store:                     st,
+		enricher:                  enricher,
+		tracker:                   tracker,
+		webhookSecret:             strings.TrimSpace(cfg.WebhookSecret),
+		track17WebhookSecret:      strings.TrimSpace(cfg.Track17WebhookSecret),
+		trackingMoreWebhookSecret: strings.TrimSpace(cfg.TrackingMoreWebhookSecret),
+		adminToken:                strings.TrimSpace(cfg.AdminToken),
+		logger:                    logger,
+		rateLimiter:               rl,
+		corsOrigins:               cfg.AllowedOrigins,
+		inFlight:                  make(map[string]*trackFlight),
 	}
 }
 
@@ -79,16 +104,39 @@ func (s *Server) Handler() http.Handler {
 	return handler
 }
 
+func (s *Server) isAdminRequest(r *http.Request) bool {
+	if s.adminToken == "" {
+		return false
+	}
+	provided := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
+	if provided == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(s.adminToken)) == 1
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	isProdPublic := isProductionEnv() && !s.isAdminRequest(r)
+
 	statuses := []domain.ProviderHealth{}
 	if s.tracker != nil {
 		if ps := s.tracker.Statuses(); ps != nil {
 			statuses = make([]domain.ProviderHealth, len(ps))
 			for i, st := range ps {
-				st.LastError = sanitizePublicError(st.LastError)
+				if isProdPublic {
+					st.LastError = ""
+					st.CircuitUntil = nil
+				} else {
+					st.LastError = sanitizePublicError(st.LastError)
+				}
 				statuses[i] = st
 			}
 		}
+	}
+
+	cacheStats := s.store.Stats()
+	if isProdPublic {
+		cacheStats.BackendMode = "edge+cache"
 	}
 
 	w.Header().Set("Cache-Control", "no-store")
@@ -96,7 +144,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":    "ok",
 		"service":   "rapid-screening-api",
 		"timestamp": time.Now().UTC(),
-		"cache":     s.store.Stats(),
+		"cache":     cacheStats,
 		"providers": statuses,
 	})
 }
@@ -179,7 +227,7 @@ func (s *Server) handleTrack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.tracker.Track(r.Context(), code, carrierInfo)
+	result, err := s.trackSingleFlight(r.Context(), code, carrierInfo)
 	if err != nil || result == nil {
 		// Degradação graciosa: se houver cache stale no disco/memória, retorna preservando disponibilidade.
 		if stale, ok := s.store.Get(code, true); ok {
@@ -241,13 +289,60 @@ func (s *Server) serveCached(w http.ResponseWriter, cached *domain.TrackingResul
 func setTrackCacheControl(w http.ResponseWriter, noStore bool) {
 	if noStore {
 		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Vercel-CDN-Cache-Control", "no-store")
 		return
 	}
-	// Cache na CDN Edge da Vercel por 5 min + revalidação em background por 10 min para zerar gasto de créditos.
-	w.Header().Set("Cache-Control", "public, s-maxage=300, stale-while-revalidate=600")
+	// Evita cache em proxies intermediários de terceiros, mantendo cache apenas na borda CDN da Vercel.
+	w.Header().Set("Cache-Control", "private, no-cache")
+	w.Header().Set("Vercel-CDN-Cache-Control", "s-maxage=300, stale-while-revalidate=600")
+}
+
+func (s *Server) trackSingleFlight(ctx context.Context, code string, carrierInfo domain.CarrierInfo) (*domain.TrackingResult, error) {
+	s.inFlightMu.Lock()
+	if existing, ok := s.inFlight[code]; ok {
+		s.inFlightMu.Unlock()
+		select {
+		case <-existing.done:
+			if existing.result != nil {
+				cp := *existing.result
+				return &cp, existing.err
+			}
+			return nil, existing.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	flight := &trackFlight{done: make(chan struct{})}
+	s.inFlight[code] = flight
+	s.inFlightMu.Unlock()
+
+	defer func() {
+		close(flight.done)
+		s.inFlightMu.Lock()
+		delete(s.inFlight, code)
+		s.inFlightMu.Unlock()
+	}()
+
+	res, err := s.tracker.Track(ctx, code, carrierInfo)
+	flight.result = res
+	flight.err = err
+	if res != nil {
+		cp := *res
+		return &cp, err
+	}
+	return nil, err
 }
 
 func (s *Server) handleRecentTrackings(w http.ResponseWriter, r *http.Request) {
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv("ENABLE_PUBLIC_RECENT")), "true") && !s.isAdminRequest(r) {
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items": []domain.RecentTrackingSummary{},
+		})
+		return
+	}
+
 	limit := 10
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {

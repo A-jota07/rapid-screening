@@ -61,13 +61,10 @@ func NewTrackingMoreProvider(cfg TrackingMoreConfig) *TrackingMoreProvider {
 	if credits < 0 {
 		credits = defaultTrackingMoreCredits
 	}
-	baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
-	if baseURL == "" {
-		baseURL = defaultTrackingMoreBaseURL
-	}
+	baseURL := sanitizeProviderBaseURL(cfg.BaseURL, defaultTrackingMoreBaseURL)
 	client := cfg.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: defaultTrackingMoreTimeout}
+		client = newSafeHTTPClient(defaultTrackingMoreTimeout)
 	}
 	circuitDur := cfg.CircuitDuration
 	if circuitDur <= 0 {

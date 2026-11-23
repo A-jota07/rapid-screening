@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -16,10 +17,11 @@ import (
 )
 
 const (
-	upstashTimeout       = 1500 * time.Millisecond
-	upstashTrackPrefix   = "rs:track:"
-	upstashRecentKey     = "rs:recent"
-	upstashRecentMaxSize = 20
+	upstashTimeout         = 1500 * time.Millisecond
+	upstashRateLimitPrefix = "rs:rl:"
+	upstashTrackPrefix     = "rs:track:"
+	upstashRecentKey       = "rs:recent"
+	upstashRecentMaxSize   = 20
 )
 
 type upstashClient struct {
@@ -46,11 +48,27 @@ func newUpstashClientFromEnv() *upstashClient {
 		return nil
 	}
 
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Host == "" {
+		return nil
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("VERCEL_ENV")), "production") {
+		if scheme != "https" {
+			return nil
+		}
+	} else if scheme != "https" && scheme != "http" {
+		return nil
+	}
+
 	return &upstashClient{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		token:   token,
 		httpClient: &http.Client{
 			Timeout: upstashTimeout,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 }
@@ -191,4 +209,28 @@ func (c *upstashClient) getRecent(limit int) ([]domain.RecentTrackingSummary, bo
 		items = items[:limit]
 	}
 	return items, true
+}
+
+// checkRateLimit implementa rate limiting distribuído por janela fixa (60s) no Upstash Redis.
+// Retorna (allowed, checked). Se checked == false (erro de rede/Redis), o chamador faz fallback ao limiter local.
+func (c *upstashClient) checkRateLimit(ip string, maxPerWindow int, windowSecs int) (bool, bool) {
+	if c == nil || ip == "" || maxPerWindow <= 0 || windowSecs <= 0 {
+		return true, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+
+	key := upstashRateLimitPrefix + ip
+	raw, err := c.exec(ctx, "INCR", key)
+	if err != nil {
+		return true, false
+	}
+	var count int64
+	if err := json.Unmarshal(raw, &count); err != nil {
+		return true, false
+	}
+	if count == 1 {
+		_, _ = c.exec(ctx, "EXPIRE", key, windowSecs)
+	}
+	return count <= int64(maxPerWindow), true
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -51,17 +52,14 @@ func NewFreeDirectProviderFromEnv() *FreeDirectProvider {
 
 // NewFreeDirectProvider instancia um FreeDirectProvider com configuração explícita.
 func NewFreeDirectProvider(cfg FreeDirectConfig) *FreeDirectProvider {
-	baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
-	if baseURL == "" {
-		baseURL = defaultFreeDirectBaseURL
-	}
+	baseURL := sanitizeProviderBaseURL(cfg.BaseURL, defaultFreeDirectBaseURL)
 	timeout := cfg.Timeout
 	if timeout <= 0 {
 		timeout = defaultFreeDirectTimeout
 	}
 	client := cfg.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: timeout}
+		client = newSafeHTTPClient(timeout)
 	}
 	circuitDur := cfg.CircuitDuration
 	if circuitDur <= 0 {
@@ -116,7 +114,7 @@ func (p *FreeDirectProvider) Track(ctx context.Context, code string, carrierInfo
 		}
 	}
 
-	endpoint := fmt.Sprintf("%s/%s", p.baseURL, cleanCode)
+	endpoint := fmt.Sprintf("%s/%s", p.baseURL, url.PathEscape(cleanCode))
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		p.state.recordFailure(time.Since(start), err, 0)
@@ -250,7 +248,7 @@ func (p *FreeDirectProvider) Track(ctx context.Context, code string, carrierInfo
 }
 
 func (p *FreeDirectProvider) trackViaCainiaoPublic(ctx context.Context, cleanCode string, carrierInfo domain.CarrierInfo) (*domain.TrackingResult, error) {
-	endpoint := fmt.Sprintf("%s?mailNos=%s&lang=pt-BR", defaultCainiaoPublicURL, cleanCode)
+	endpoint := fmt.Sprintf("%s?mailNos=%s&lang=pt-BR", defaultCainiaoPublicURL, url.QueryEscape(cleanCode))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)

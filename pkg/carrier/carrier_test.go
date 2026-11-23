@@ -15,6 +15,8 @@ func TestSanitizeCode(t *testing.T) {
 		{" aa 123-456 789-br \n\t", "AA123456789BR"},
 		{"577-12345678", "57712345678"},
 		{"  lgg-84920194 br ", "LGG84920194BR"},
+		{"$$$$$!!??../", ""},
+		{"AA123456789BR?foo=bar", "AA123456789BRFOOBAR"},
 		{"", ""},
 	}
 
@@ -28,15 +30,15 @@ func TestSanitizeCode(t *testing.T) {
 
 func TestDetectCarrier(t *testing.T) {
 	cases := []struct {
-		name             string
-		code             string
-		wantCode         string
-		wantName         string
-		want17ID         int
-		wantTMCode       string
-		wantDetectedBy   string
-		wantMinConf      float64
-		wantExactConf    float64
+		name           string
+		code           string
+		wantCode       string
+		wantName       string
+		want17ID       int
+		wantTMCode     string
+		wantDetectedBy string
+		wantMinConf    float64
+		wantExactConf  float64
 	}{
 		{
 			name:           "Correios demo",

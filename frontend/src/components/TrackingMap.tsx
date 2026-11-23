@@ -53,21 +53,47 @@ interface OsrmRouteResponse {
   }>;
 }
 
+const MAX_OSRM_WAYPOINTS = 15;
+
+function isValidLatLng(lat: unknown, lng: unknown): lat is number {
+  return (
+    typeof lat === 'number' &&
+    typeof lng === 'number' &&
+    Number.isFinite(lat) &&
+    Number.isFinite(lng) &&
+    lat >= -90 &&
+    lat <= 90 &&
+    lng >= -180 &&
+    lng <= 180 &&
+    (lat !== 0 || lng !== 0)
+  );
+}
+
 async function fetchOsrmRoadGeometry(
   points: [number, number][],
   signal: AbortSignal,
 ): Promise<[number, number][] | null> {
   if (points.length < 2) return null;
-  const coordsParam = points
+  const bounded = points.slice(0, MAX_OSRM_WAYPOINTS);
+  const coordsParam = bounded
     .map(([lat, lng]) => `${lng.toFixed(5)},${lat.toFixed(5)}`)
     .join(';');
   const url = `https://router.project-osrm.org/route/v1/driving/${coordsParam}?overview=full&geometries=geojson`;
-  const resp = await fetch(url, { signal });
-  if (!resp.ok) return null;
-  const data = (await resp.json()) as OsrmRouteResponse;
-  const rawCoords = data.routes?.[0]?.geometry?.coordinates;
-  if (!Array.isArray(rawCoords) || rawCoords.length < 2) return null;
-  return rawCoords.map(([lng, lat]) => [lat, lng]);
+  const timeoutController = new AbortController();
+  const timeoutId = window.setTimeout(() => timeoutController.abort(), 5000);
+  const onParentAbort = () => timeoutController.abort();
+  signal.addEventListener('abort', onParentAbort, { once: true });
+  try {
+    const resp = await fetch(url, { signal: timeoutController.signal });
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as OsrmRouteResponse;
+    const rawCoords = data.routes?.[0]?.geometry?.coordinates;
+    if (!Array.isArray(rawCoords) || rawCoords.length < 2) return null;
+    return rawCoords.map(([lng, lat]) => [lat, lng]);
+  } finally {
+    window.clearTimeout(timeoutId);
+    signal.removeEventListener('abort', onParentAbort);
+  }
 }
 
 function createPinIcon(
@@ -128,6 +154,13 @@ function getMarkerIcon(type: FacilityType, isActiveCdd = false): L.DivIcon {
         '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>',
         34,
       );
+    default:
+      return createPinIcon(
+        '#C47D2B',
+        '#FCFBF8',
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/></svg>',
+        30,
+      );
   }
 }
 
@@ -179,6 +212,8 @@ function facilityLabel(type: FacilityType): string {
       return 'CDD Alocado';
     case 'DESTINATION':
       return 'Destino Final';
+    default:
+      return 'Unidade';
   }
 }
 
@@ -222,6 +257,7 @@ export function TrackingMap({ result }: TrackingMapProps) {
   const [gpsLoading, setGpsLoading] = useState(false);
   const [gpsError, setGpsError] = useState<string | null>(null);
   const [recenterCounter, setRecenterCounter] = useState(0);
+  const [allowExternalGpsRoute, setAllowExternalGpsRoute] = useState(false);
 
   // Reset GPS error/route cleanly when switching to a different tracking code
   useEffect(() => {
@@ -232,16 +268,23 @@ export function TrackingMap({ result }: TrackingMapProps) {
   const validRoutePoints = useMemo<GeoPoint[]>(() => {
     let raw: GeoPoint[] = [];
     if (Array.isArray(result.routePoints) && result.routePoints.length > 0) {
-      raw = result.routePoints.filter(
-        (p) =>
-          typeof p.lat === 'number' &&
-          typeof p.lng === 'number' &&
-          (p.lat !== 0 || p.lng !== 0),
-      );
+      raw = result.routePoints.filter((p) => isValidLatLng(p.lat, p.lng));
     } else {
-      if (result.origin) raw.push(result.origin);
-      if (result.currentLocation) raw.push(result.currentLocation);
-      if (result.destination) raw.push(result.destination);
+      if (result.origin && isValidLatLng(result.origin.lat, result.origin.lng)) {
+        raw.push(result.origin);
+      }
+      if (
+        result.currentLocation &&
+        isValidLatLng(result.currentLocation.lat, result.currentLocation.lng)
+      ) {
+        raw.push(result.currentLocation);
+      }
+      if (
+        result.destination &&
+        isValidLatLng(result.destination.lat, result.destination.lng)
+      ) {
+        raw.push(result.destination);
+      }
     }
 
     // Deduplica pontos na mesma cidade/coordenada para evitar zigue-zague ou pinos sobrepostos
@@ -272,13 +315,9 @@ export function TrackingMap({ result }: TrackingMapProps) {
   const [gpsRoadPositions, setGpsRoadPositions] = useState<[number, number][] | null>(null);
 
   const cdd = result.cdd;
-  const hasCddCoords =
-    Boolean(cdd) &&
-    typeof cdd?.lat === 'number' &&
-    typeof cdd?.lng === 'number' &&
-    (cdd.lat !== 0 || cdd.lng !== 0);
+  const hasCddCoords = Boolean(cdd) && isValidLatLng(cdd?.lat, cdd?.lng);
 
-  // Busca o traçado rodoviário real (BRs/estradas via OSRM) entre os pontos da encomenda
+  // Busca o traçado rodoviário real (BRs/estradas via OSRM) entre os hubs públicos da encomenda
   useEffect(() => {
     setRoadRoutePositions(null);
     if (routePositions.length < 2) return;
@@ -295,10 +334,11 @@ export function TrackingMap({ result }: TrackingMapProps) {
     return () => controller.abort();
   }, [routePositions]);
 
-  // Busca o traçado viário real de ruas entre o GPS do usuário e o CDD
+  // Privacidade (LGPD): só envia coordenadas GPS reais do usuário ao OSRM público mediante consentimento explícito
   useEffect(() => {
     setGpsRoadPositions(null);
     if (!userLocation || !cdd || !hasCddCoords) return;
+    if (!userLocation.simulated && !allowExternalGpsRoute) return;
     const controller = new AbortController();
     fetchOsrmRoadGeometry(
       [
@@ -316,7 +356,7 @@ export function TrackingMap({ result }: TrackingMapProps) {
         // Fallback automático para linha tracejada direta
       });
     return () => controller.abort();
-  }, [userLocation, cdd, hasCddCoords]);
+  }, [userLocation, cdd, hasCddCoords, allowExternalGpsRoute]);
 
   // When GPS route is active, focus bounds specifically between User and CDD (plus nearby context)
   const fitBoundsPoints = useMemo<[number, number][]>(() => {
@@ -417,6 +457,7 @@ export function TrackingMap({ result }: TrackingMapProps) {
   const handleClearGps = () => {
     setUserLocation(null);
     setGpsError(null);
+    setAllowExternalGpsRoute(false);
     setRecenterCounter((c) => c + 1);
   };
 
@@ -792,6 +833,21 @@ export function TrackingMap({ result }: TrackingMapProps) {
                           </strong>
                         </div>
                       </div>
+
+                      {!userLocation.simulated && (
+                        <label className="mt-2.5 flex items-start gap-2 text-[11px] leading-snug">
+                          <input
+                            type="checkbox"
+                            checked={allowExternalGpsRoute}
+                            onChange={(e) => setAllowExternalGpsRoute(e.target.checked)}
+                            className="mt-0.5"
+                          />
+                          <span>
+                            Traçar rota pelas ruas (envia suas coordenadas ao serviço público
+                            OSRM, router.project-osrm.org)
+                          </span>
+                        </label>
+                      )}
                     </div>
                   )}
                 </div>

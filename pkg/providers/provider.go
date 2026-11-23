@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -204,6 +206,38 @@ func parseEnvInt(key string, fallback int) int {
 		return fallback
 	}
 	return val
+}
+
+// newSafeHTTPClient cria um *http.Client que não segue redirecionamentos automaticamente,
+// impedindo vazamento de headers customizados de API Key (17token, Tracking-Api-Key) e SSRF via redirect.
+func newSafeHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// sanitizeProviderBaseURL normaliza a URL base do provedor e exige HTTPS em produção na Vercel.
+func sanitizeProviderBaseURL(raw, fallback string) string {
+	baseURL := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if baseURL == "" {
+		return fallback
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Host == "" {
+		return fallback
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("VERCEL_ENV")), "production") {
+		if scheme != "https" {
+			return fallback
+		}
+	} else if scheme != "https" && scheme != "http" {
+		return fallback
+	}
+	return baseURL
 }
 
 func isQuotaOrRateError(httpStatus int, msg string) bool {

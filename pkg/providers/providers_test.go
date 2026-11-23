@@ -354,9 +354,9 @@ func TestProviderChain_FallbackWhenProvidersFailOrExhaustCredits(t *testing.T) {
 				"courier_code":    "brazil-correios",
 				"origin_info": map[string]any{
 					"trackinfo": []map[string]any{{
-						"checkpoint_date":   "2026-11-18T10:00:00Z",
-						"tracking_detail":   "Objeto entregue ao destinatário",
-						"location":          "São Paulo - SP",
+						"checkpoint_date": "2026-11-18T10:00:00Z",
+						"tracking_detail": "Objeto entregue ao destinatário",
+						"location":        "São Paulo - SP",
 					}},
 				},
 			}},
